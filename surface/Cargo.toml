@@ -1,0 +1,16 @@
+[package]
+name = "surface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The pricing model: a vol surface and Black-Scholes over it. Deliberately a
+# sibling of `core` rather than a module inside it, because it runs in f64 and
+# the contract must never evaluate a float. `core` is the integer money the
+# chain enforces; `surface` is the model the engine quotes from, and the chain
+# only ever sees the integer premium the engine decided to ask for.
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1"

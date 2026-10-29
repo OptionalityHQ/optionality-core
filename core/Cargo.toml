@@ -1,0 +1,14 @@
+[package]
+name = "bounded-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The money. Compiled to wasm for the contract and natively for the engine, so
+# the venue and the chain cannot disagree about what a trade costs. Nothing here
+# may touch near-sdk, the network or the filesystem outside of tests.
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1"

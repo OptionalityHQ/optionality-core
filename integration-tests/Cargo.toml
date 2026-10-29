@@ -1,0 +1,15 @@
+[package]
+name = "integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+anyhow = "1"
+near-workspaces = "0.24.0"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

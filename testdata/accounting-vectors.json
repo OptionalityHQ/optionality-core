@@ -1,0 +1,1290 @@
+{
+  "comment": "Shared contract/simulator accounting vectors.",
+  "generated_by": "bounded-options accounting.rs",
+  "rows": [
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "0",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "10000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "10000000",
+        "maker": "2000000"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "99999999",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "10000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "10000000",
+        "maker": "2000000"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "100000000",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "10000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "10000000",
+        "maker": "2000000"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "103000000",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "7000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "7000000",
+        "maker": "5000000"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "105000000",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "5000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "5000000",
+        "maker": "7000000"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "109999999",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "1",
+      "valid": true,
+      "fixed": {
+        "buyer": "1",
+        "maker": "11999999"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "110000000",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "12000000"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "120000000",
+        "premium": "2000000"
+      },
+      "collateral": "10000000",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "12000000"
+      },
+      "voided": {
+        "buyer": "2000000",
+        "maker": "10000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "0",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "20000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "20000000",
+        "maker": "5000000"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "99999999",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "20000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "20000000",
+        "maker": "5000000"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "100000000",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "20000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "20000000",
+        "maker": "5000000"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "103000000",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "14000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "14000000",
+        "maker": "11000000"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "105000000",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "10000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "10000000",
+        "maker": "15000000"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "109999999",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "2",
+      "valid": true,
+      "fixed": {
+        "buyer": "2",
+        "maker": "24999998"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "110000000",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "25000000"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "2000000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "120000000",
+        "premium": "5000000"
+      },
+      "collateral": "20000000",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "25000000"
+      },
+      "voided": {
+        "buyer": "5000000",
+        "maker": "20000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "0",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "15000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "15000000",
+        "maker": "3000000"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "99999999",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "15000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "15000000",
+        "maker": "3000000"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "100000000",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "15000000",
+      "valid": true,
+      "fixed": {
+        "buyer": "15000000",
+        "maker": "3000000"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "103000000",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "10500000",
+      "valid": true,
+      "fixed": {
+        "buyer": "10500000",
+        "maker": "7500000"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "105000000",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "7500000",
+      "valid": true,
+      "fixed": {
+        "buyer": "7500000",
+        "maker": "10500000"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "109999999",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "1",
+      "valid": true,
+      "fixed": {
+        "buyer": "1",
+        "maker": "17999999"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "110000000",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "18000000"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1500000",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "120000000",
+        "premium": "3000000"
+      },
+      "collateral": "15000000",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "18000000"
+      },
+      "voided": {
+        "buyer": "3000000",
+        "maker": "15000000"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "0",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "30",
+      "valid": true,
+      "fixed": {
+        "buyer": "30",
+        "maker": "10"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "99999999",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "30",
+      "valid": true,
+      "fixed": {
+        "buyer": "30",
+        "maker": "10"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "100000000",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "30",
+      "valid": true,
+      "fixed": {
+        "buyer": "30",
+        "maker": "10"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "103000000",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "21",
+      "valid": true,
+      "fixed": {
+        "buyer": "21",
+        "maker": "19"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "105000000",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "15",
+      "valid": true,
+      "fixed": {
+        "buyer": "15",
+        "maker": "25"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "109999999",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "40"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "110000000",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "40"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "120000000",
+        "premium": "10"
+      },
+      "collateral": "30",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "40"
+      },
+      "voided": {
+        "buyer": "10",
+        "maker": "30"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "0",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "70",
+      "valid": true,
+      "fixed": {
+        "buyer": "70",
+        "maker": "1"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "99999999",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "70",
+      "valid": true,
+      "fixed": {
+        "buyer": "70",
+        "maker": "1"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "100000000",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "70",
+      "valid": true,
+      "fixed": {
+        "buyer": "70",
+        "maker": "1"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "103000000",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "49",
+      "valid": true,
+      "fixed": {
+        "buyer": "49",
+        "maker": "22"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "105000000",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "35",
+      "valid": true,
+      "fixed": {
+        "buyer": "35",
+        "maker": "36"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "109999999",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "71"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "110000000",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "71"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "7",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "120000000",
+        "premium": "1"
+      },
+      "collateral": "70",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "71"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "70"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "0",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "10",
+      "valid": true,
+      "fixed": {
+        "buyer": "10",
+        "maker": "7"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "99999999",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "10",
+      "valid": true,
+      "fixed": {
+        "buyer": "10",
+        "maker": "7"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "100000000",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "10",
+      "valid": true,
+      "fixed": {
+        "buyer": "10",
+        "maker": "7"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "103000000",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "7",
+      "valid": true,
+      "fixed": {
+        "buyer": "7",
+        "maker": "10"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "105000000",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "5",
+      "valid": true,
+      "fixed": {
+        "buyer": "5",
+        "maker": "12"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "109999999",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "17"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "110000000",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "17"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "1000000",
+        "low_strike": "100000000",
+        "high_strike": "110000000",
+        "price": "120000000",
+        "premium": "7"
+      },
+      "collateral": "10",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "17"
+      },
+      "voided": {
+        "buyer": "7",
+        "maker": "10"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "0",
+        "premium": "2"
+      },
+      "collateral": "5",
+      "payout": "4",
+      "valid": true,
+      "fixed": {
+        "buyer": "4",
+        "maker": "3"
+      },
+      "voided": {
+        "buyer": "2",
+        "maker": "5"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "0",
+        "premium": "1"
+      },
+      "collateral": "1429",
+      "payout": "1428",
+      "valid": true,
+      "fixed": {
+        "buyer": "1428",
+        "maker": "2"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "1429"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "100",
+        "premium": "2"
+      },
+      "collateral": "5",
+      "payout": "4",
+      "valid": true,
+      "fixed": {
+        "buyer": "4",
+        "maker": "3"
+      },
+      "voided": {
+        "buyer": "2",
+        "maker": "5"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "100",
+        "premium": "1"
+      },
+      "collateral": "1429",
+      "payout": "1428",
+      "valid": true,
+      "fixed": {
+        "buyer": "1428",
+        "maker": "2"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "1429"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "103",
+        "premium": "2"
+      },
+      "collateral": "5",
+      "payout": "3",
+      "valid": true,
+      "fixed": {
+        "buyer": "3",
+        "maker": "4"
+      },
+      "voided": {
+        "buyer": "2",
+        "maker": "5"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "103",
+        "premium": "1"
+      },
+      "collateral": "1429",
+      "payout": "1000",
+      "valid": true,
+      "fixed": {
+        "buyer": "1000",
+        "maker": "430"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "1429"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "105",
+        "premium": "2"
+      },
+      "collateral": "5",
+      "payout": "2",
+      "valid": true,
+      "fixed": {
+        "buyer": "2",
+        "maker": "5"
+      },
+      "voided": {
+        "buyer": "2",
+        "maker": "5"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "105",
+        "premium": "1"
+      },
+      "collateral": "1429",
+      "payout": "714",
+      "valid": true,
+      "fixed": {
+        "buyer": "714",
+        "maker": "716"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "1429"
+      }
+    },
+    {
+      "input": {
+        "quantity": "3",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "110",
+        "premium": "2"
+      },
+      "collateral": "5",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "7"
+      },
+      "voided": {
+        "buyer": "2",
+        "maker": "5"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1000",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "110",
+        "premium": "1"
+      },
+      "collateral": "1429",
+      "payout": "0",
+      "valid": true,
+      "fixed": {
+        "buyer": "0",
+        "maker": "1430"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "1429"
+      }
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "0",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "105",
+        "premium": "1"
+      },
+      "collateral": null,
+      "payout": null,
+      "valid": false,
+      "fixed": null,
+      "voided": null
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "7",
+        "low_strike": "110",
+        "high_strike": "100",
+        "price": "105",
+        "premium": "1"
+      },
+      "collateral": null,
+      "payout": null,
+      "valid": false,
+      "fixed": null,
+      "voided": null
+    },
+    {
+      "input": {
+        "quantity": "1",
+        "scale": "7",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "90",
+        "premium": "1"
+      },
+      "collateral": "2",
+      "payout": "1",
+      "valid": true,
+      "fixed": {
+        "buyer": "1",
+        "maker": "2"
+      },
+      "voided": {
+        "buyer": "1",
+        "maker": "2"
+      }
+    },
+    {
+      "input": {
+        "quantity": "340282366920938463463374607431768211455",
+        "scale": "1",
+        "low_strike": "100",
+        "high_strike": "110",
+        "price": "105",
+        "premium": "1"
+      },
+      "collateral": null,
+      "payout": null,
+      "valid": false,
+      "fixed": null,
+      "voided": null
+    }
+  ]
+}

@@ -1,0 +1,3478 @@
+#![doc = "Fully collateralized, cash-settled put-spread tickets on NEAR testnet."]
+
+// Payoff, fee and vault arithmetic all come from the shared crate, so the
+// engine that quotes this market off-chain evaluates the identical functions.
+// Nothing here is float: the contract sees integer token units and integer
+// basis points, and the mid it is handed is bounded by the payoff ceiling.
+pub use bounded_core::{accounting, fees, pool};
+use pool::{Pool, Written};
+
+use near_sdk::borsh::BorshSerialize;
+use near_sdk::json_types::U128;
+use near_sdk::store::LookupMap;
+use near_sdk::{
+    env, ext_contract, near, require, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault,
+    Promise,
+};
+
+const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(20);
+const GAS_FOR_ORACLE_QUERY: Gas = Gas::from_tgas(25);
+const GAS_FOR_CALLBACK: Gas = Gas::from_tgas(25);
+const MAX_OBSERVATIONS: u32 = 100;
+const MAX_OPEN_OFFERS: u64 = 10_000;
+const MAX_OPEN_BIDS: u64 = 10_000;
+const MAX_OPEN_TICKETS: u64 = 10_000;
+const MAX_PENDING_WITHDRAWALS: u64 = 1_000;
+const MAX_OFFERS_PER_SERIES: usize = 200;
+const UNIT_PRECISION: u128 = 1_000_000;
+const MAX_ACCEPT_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+const MAX_FINALIZE_WINDOW_NS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+const SETTLEMENT_GRACE_NS: u64 = 300 * 1_000_000_000;
+const PRICE_BOUND_FACTOR: u128 = 10;
+
+#[derive(BorshStorageKey, BorshSerialize)]
+#[borsh(crate = "near_sdk::borsh")]
+enum StorageKey {
+    Series,
+    Offers,
+    Tickets,
+    Balances,
+    Withdrawals,
+    OwnerWithdrawals,
+    SeriesOffers,
+    Bids,
+    SeriesBids,
+    HolderTickets,
+    LpShares,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone)]
+pub struct Config {
+    pub admin: AccountId,
+    pub token: AccountId,
+    pub oracle: AccountId,
+    pub paused: bool,
+}
+
+/// Immutable per-expiry settlement policy. A series is created once and its
+/// oracle account, feed, strikes and timing windows cannot be replaced.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, PartialEq, Debug)]
+pub struct Series {
+    pub underlying: String,
+    pub kind: SpreadKind,
+    pub expiry_ns: u64,
+    pub accept_until_ns: u64,
+    pub finalize_until_ns: u64,
+    pub low_strike: u128,
+    pub high_strike: u128,
+    pub price_scale: u128,
+    pub min_confidence_bps: u16,
+    pub oracle_feed: String,
+    pub settlement: Settlement,
+    pub pending_since_ns: u64,
+}
+
+/// The payoff family of a series. Puts protect a fall, calls protect a rise;
+/// both are bounded spreads with the same collateral rule.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, PartialEq, Debug)]
+pub enum SpreadKind {
+    Put,
+    Call,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, PartialEq, Debug)]
+pub enum Settlement {
+    Open,
+    Pending,
+    Fixed { price: u128, publish_time_ns: u64 },
+    Void,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone)]
+pub struct Offer {
+    pub series_id: u64,
+    pub maker: AccountId,
+    pub taker: Option<AccountId>,
+    pub quantity: u128,
+    pub premium: u128,
+    pub collateral: u128,
+    pub expires_ns: u64,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone)]
+pub struct Ticket {
+    pub series_id: u64,
+    pub buyer: AccountId,
+    pub maker: AccountId,
+    pub quantity: u128,
+    pub collateral: u128,
+    pub premium: u128,
+    /// What the current holder paid for this ticket. It starts equal to
+    /// `premium` and is restated when the ticket is closed into a bid, so a
+    /// position view can report a real cost basis. Settlement still pays out
+    /// `premium`, which is the amount the maker is owed.
+    pub cost: u128,
+    /// The venue's share of `premium`, for a ticket the pool wrote. Zero for a
+    /// ticket a person wrote. It is stored rather than recomputed because the
+    /// margin can change between entry and settlement, and a settlement must
+    /// unwind exactly the split that was made.
+    pub venue_cut: u128,
+}
+
+/// A resting bid: someone willing to BUY a protection ticket at `premium`,
+/// with that premium escrowed. A seller fills it and becomes the maker.
+#[near(serializers = [json, borsh])]
+#[derive(Clone)]
+pub struct Bid {
+    pub series_id: u64,
+    pub owner: AccountId,
+    pub quantity: u128,
+    pub premium: u128,
+    pub expires_ns: u64,
+}
+
+/// One held ticket, as the portfolio screen reads it.
+#[near(serializers = [json])]
+#[derive(Clone)]
+pub struct PositionView {
+    pub ticket_id: u64,
+    pub series_id: u64,
+    pub side: String,
+    /// Who stands behind this ticket. A holder needs it to know whether they can
+    /// sell the position back to the vault or only into someone's bid, and a
+    /// gateway should not have to read the ticket record to find out.
+    pub maker: AccountId,
+    pub quantity: U128,
+    pub cost: U128,
+    pub premium: U128,
+    pub collateral: U128,
+    pub kind: SpreadKind,
+    pub underlying: String,
+    pub low_strike: U128,
+    pub high_strike: U128,
+    pub price_scale: U128,
+    pub expiry_ns: u64,
+    pub settlement: String,
+    pub fixed_price: Option<U128>,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone)]
+pub struct BidView {
+    pub bid_id: u64,
+    pub owner: AccountId,
+    pub quantity: U128,
+    pub premium: U128,
+    pub unit_premium: U128,
+    pub expires_ns: u64,
+}
+
+/// The vault as the UI and the LP screen read it. `free_equity` is what the pool
+/// can still stand behind; `utilisation_bps` is the same number as a percentage
+/// of the whole balance sheet.
+#[near(serializers = [json])]
+#[derive(Clone)]
+pub struct PoolState {
+    pub equity: U128,
+    pub reserved: U128,
+    /// Margin on open tickets, which a void would hand back.
+    pub venue_locked: U128,
+    /// Margin the venue can sweep now.
+    pub venue: U128,
+    pub consolation: U128,
+    pub shares: U128,
+    pub free_equity: U128,
+    pub utilisation_bps: U128,
+    pub open_tickets: u64,
+    pub venue_account: AccountId,
+    pub margin_bps: u32,
+    pub impact_bps: u32,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, PartialEq, Debug)]
+pub enum WithdrawalStatus {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone)]
+pub struct Withdrawal {
+    pub owner: AccountId,
+    pub amount: u128,
+    pub status: WithdrawalStatus,
+    pub requested_ns: u64,
+}
+
+/// Public price-level view. Amounts are `U128` so a browser never parses a
+/// value wider than IEEE-754 can hold exactly.
+#[near(serializers = [json])]
+#[derive(Clone)]
+pub struct BookOffer {
+    pub offer_id: u64,
+    pub maker: AccountId,
+    pub quantity: U128,
+    pub premium: U128,
+    pub unit_premium: U128,
+    pub taker: Option<AccountId>,
+    pub expires_ns: u64,
+}
+
+/// Result of a market sweep: one ticket per offer taken, plus the slippage the
+/// taker actually paid versus the size requested.
+#[near(serializers = [json])]
+#[derive(Clone)]
+pub struct MarketFill {
+    pub tickets: Vec<u64>,
+    pub filled_quantity: U128,
+    pub total_premium: U128,
+    pub unfilled_quantity: U128,
+    pub worst_unit_premium: U128,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone)]
+pub struct PriceObservation {
+    pub price: u128,
+    pub publish_time_ns: u64,
+    pub confidence_bps: u16,
+}
+
+#[near(serializers = [json])]
+pub struct Stats {
+    pub series_count: u64,
+    pub offer_count: u64,
+    pub ticket_count: u64,
+    pub withdrawal_count: u64,
+    pub open_offer_count: u64,
+    pub open_bid_count: u64,
+    pub open_ticket_count: u64,
+    pub pending_withdrawal_count: u64,
+    pub total_available: U128,
+    pub total_offer_collateral: U128,
+    pub total_bid_escrow: U128,
+    pub total_ticket_collateral: U128,
+    pub total_ticket_premium: U128,
+    pub total_pending_withdrawals: U128,
+}
+
+#[ext_contract(ext_oracle)]
+pub trait Oracle {
+    fn get_observations(
+        &self,
+        feed_id: String,
+        from_ns: u64,
+        to_ns: u64,
+        limit: u32,
+    ) -> Vec<PriceObservation>;
+}
+
+#[ext_contract(ext_token)]
+pub trait FungibleToken {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+}
+
+fn emit(event: &str, data: near_sdk::serde_json::Value) {
+    env::log_str(&format!(
+        "EVENT_JSON:{}",
+        near_sdk::serde_json::json!({
+            "standard": "bounded-options",
+            "version": "1.0.0",
+            "event": event,
+            "data": data
+        })
+    ));
+}
+
+#[near(contract_state)]
+#[derive(PanicOnDefault)]
+pub struct Contract {
+    config: Config,
+    series: LookupMap<u64, Series>,
+    offers: LookupMap<u64, Offer>,
+    tickets: LookupMap<u64, Ticket>,
+    balances: LookupMap<AccountId, u128>,
+    withdrawals: LookupMap<u64, Withdrawal>,
+    owner_withdrawals: LookupMap<AccountId, Vec<u64>>,
+    series_offers: LookupMap<u64, Vec<u64>>,
+    bids: LookupMap<u64, Bid>,
+    series_bids: LookupMap<u64, Vec<u64>>,
+    /// Which tickets each account is exposed to, so the portfolio view
+    /// reads a list instead of scanning every ticket.
+    holder_tickets: LookupMap<AccountId, Vec<u64>>,
+    // ---- the vault ----
+    // Held as plain fields rather than one `Pool` so `bounded-core` needs
+    // no borsh or near-sdk dependency: the chain-safe crate stays chain-safe,
+    // and the contract is the only place that knows how these are stored.
+    pool_equity: u128,
+    pool_reserved: u128,
+    /// Margin on tickets that are still open: a void gives it back, so it is
+    /// never sweepable and never part of what an LP owns.
+    pool_venue_locked: u128,
+    /// Margin on tickets that have run off: the venue may take it.
+    pool_venue: u128,
+    pool_consolation: u128,
+    pool_shares: u128,
+    /// Shares each LP holds against `pool_shares`.
+    lp_shares: LookupMap<AccountId, u128>,
+    /// Count of open tickets whose maker is the vault.
+    pool_tickets: u64,
+    venue: AccountId,
+    margin_bps: u32,
+    impact_bps: u32,
+    next_series: u64,
+    next_offer: u64,
+    next_bid: u64,
+    next_ticket: u64,
+    next_withdrawal: u64,
+    total_available: u128,
+    total_offer_collateral: u128,
+    total_bid_escrow: u128,
+    total_ticket_collateral: u128,
+    total_ticket_premium: u128,
+    total_pending_withdrawals: u128,
+    open_offer_count: u64,
+    open_bid_count: u64,
+    open_ticket_count: u64,
+    pending_withdrawal_count: u64,
+}
+
+#[near]
+impl Contract {
+    #[init]
+    pub fn new(admin: AccountId, token: AccountId, oracle: AccountId) -> Self {
+        // The venue accrual is swept by the admin until a deployment names a
+        // separate fee account.
+        let venue = admin.clone();
+        Self {
+            config: Config {
+                admin,
+                token,
+                oracle,
+                paused: false,
+            },
+            series: LookupMap::new(StorageKey::Series),
+            offers: LookupMap::new(StorageKey::Offers),
+            tickets: LookupMap::new(StorageKey::Tickets),
+            balances: LookupMap::new(StorageKey::Balances),
+            withdrawals: LookupMap::new(StorageKey::Withdrawals),
+            owner_withdrawals: LookupMap::new(StorageKey::OwnerWithdrawals),
+            series_offers: LookupMap::new(StorageKey::SeriesOffers),
+            bids: LookupMap::new(StorageKey::Bids),
+            series_bids: LookupMap::new(StorageKey::SeriesBids),
+            holder_tickets: LookupMap::new(StorageKey::HolderTickets),
+            pool_equity: 0,
+            pool_reserved: 0,
+            pool_venue_locked: 0,
+            pool_venue: 0,
+            pool_consolation: 0,
+            pool_shares: 0,
+            lp_shares: LookupMap::new(StorageKey::LpShares),
+            pool_tickets: 0,
+            venue,
+            margin_bps: fees::Terms::STANDARD.margin_bps,
+            impact_bps: fees::Terms::STANDARD.impact_bps,
+            next_series: 0,
+            next_offer: 0,
+            next_bid: 0,
+            next_ticket: 0,
+            next_withdrawal: 0,
+            total_available: 0,
+            total_offer_collateral: 0,
+            total_bid_escrow: 0,
+            total_ticket_collateral: 0,
+            total_ticket_premium: 0,
+            total_pending_withdrawals: 0,
+            open_offer_count: 0,
+            open_bid_count: 0,
+            open_ticket_count: 0,
+            pending_withdrawal_count: 0,
+        }
+    }
+
+    // ---------- custody ----------
+
+    /// NEP-141 receiver. Returns the unused amount; a wrong token, wrong
+    /// message or paused contract rejects the whole transfer without state
+    /// changes.
+    ///
+    /// Two destinations: `"deposit"` credits the sender's tradable balance,
+    /// `"pool-deposit"` mints vault shares against the pool's net asset value.
+    pub fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> String {
+        if env::predecessor_account_id() != self.config.token || self.config.paused {
+            return amount.0.to_string();
+        }
+        match msg.as_str() {
+            "deposit" => self.credit(&sender_id, amount.0),
+            "pool-deposit" => {
+                let mut vault = self.load_pool();
+                let Some(minted) = vault.deposit(amount.0) else {
+                    return amount.0.to_string();
+                };
+                self.save_pool(&vault);
+                let held = self.lp_shares.get(&sender_id).copied().unwrap_or(0);
+                self.lp_shares.insert(
+                    sender_id.clone(),
+                    held.checked_add(minted).expect("share overflow"),
+                );
+                emit(
+                    "pool_deposit",
+                    near_sdk::serde_json::json!({
+                        "lp": sender_id,
+                        "amount": amount.0,
+                        "shares_minted": minted,
+                        "equity": vault.equity
+                    }),
+                );
+            }
+            _ => return amount.0.to_string(),
+        }
+        "0".to_string()
+    }
+
+    pub fn withdraw(&mut self, amount: U128) -> Promise {
+        require!(!self.config.paused, "withdrawals paused");
+        require!(amount.0 > 0, "amount must be positive");
+        require!(
+            self.pending_withdrawal_count < MAX_PENDING_WITHDRAWALS,
+            "withdrawal capacity reached"
+        );
+        let owner = env::predecessor_account_id();
+        self.debit(&owner, amount.0);
+
+        let withdrawal_id = self.next_withdrawal;
+        self.next_withdrawal = self
+            .next_withdrawal
+            .checked_add(1)
+            .expect("withdrawal counter overflow");
+        self.total_pending_withdrawals = self
+            .total_pending_withdrawals
+            .checked_add(amount.0)
+            .expect("pending total overflow");
+        self.pending_withdrawal_count = self
+            .pending_withdrawal_count
+            .checked_add(1)
+            .expect("withdrawal count overflow");
+        self.withdrawals.insert(
+            withdrawal_id,
+            Withdrawal {
+                owner: owner.clone(),
+                amount: amount.0,
+                status: WithdrawalStatus::Pending,
+                requested_ns: env::block_timestamp(),
+            },
+        );
+        let mut ids = self
+            .owner_withdrawals
+            .get(&owner)
+            .cloned()
+            .unwrap_or_default();
+        ids.push(withdrawal_id);
+        self.owner_withdrawals.insert(owner.clone(), ids);
+        emit(
+            "withdrawal_requested",
+            near_sdk::serde_json::json!({
+                "withdrawal_id": withdrawal_id,
+                "owner": owner,
+                "amount": amount.0
+            }),
+        );
+
+        ext_token::ext(self.config.token.clone())
+            .with_static_gas(GAS_FOR_FT_TRANSFER)
+            .with_attached_deposit(NearToken::from_yoctonear(1))
+            .ft_transfer(owner, amount, Some("bounded-options withdrawal".to_string()))
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_CALLBACK)
+                    .on_withdraw(withdrawal_id),
+            )
+    }
+
+    // ---------- market ----------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_series(
+        &mut self,
+        underlying: String,
+        kind: SpreadKind,
+        expiry_ns: u64,
+        accept_until_ns: u64,
+        finalize_until_ns: u64,
+        low_strike: U128,
+        high_strike: U128,
+        price_scale: U128,
+        min_confidence_bps: u16,
+        oracle_feed: String,
+    ) -> u64 {
+        self.assert_admin();
+        let now = env::block_timestamp();
+        require!(expiry_ns > now, "expiry must be in the future");
+        require!(
+            accept_until_ns > expiry_ns,
+            "accept window must follow expiry"
+        );
+        require!(
+            finalize_until_ns > accept_until_ns,
+            "finalize must follow accept window"
+        );
+        require!(
+            accept_until_ns
+                <= expiry_ns
+                    .checked_add(MAX_ACCEPT_WINDOW_NS)
+                    .expect("accept window overflow"),
+            "accept window too long"
+        );
+        require!(
+            finalize_until_ns
+                <= expiry_ns
+                    .checked_add(MAX_FINALIZE_WINDOW_NS)
+                    .expect("finalize window overflow"),
+            "finalize window too long"
+        );
+        require!(high_strike.0 > low_strike.0, "invalid strikes");
+        require!(price_scale.0 > 0, "price scale required");
+        require!(min_confidence_bps <= 10_000, "invalid confidence");
+
+        let id = self.next_series;
+        self.next_series = self
+            .next_series
+            .checked_add(1)
+            .expect("series counter overflow");
+        self.series.insert(
+            id,
+            Series {
+                underlying,
+                kind,
+                expiry_ns,
+                accept_until_ns,
+                finalize_until_ns,
+                low_strike: low_strike.0,
+                high_strike: high_strike.0,
+                price_scale: price_scale.0,
+                min_confidence_bps,
+                oracle_feed,
+                settlement: Settlement::Open,
+                pending_since_ns: 0,
+            },
+        );
+        emit(
+            "series_created",
+            near_sdk::serde_json::json!({
+                "series_id": id,
+                "expiry_ns": expiry_ns,
+                "low_strike": low_strike.0,
+                "high_strike": high_strike.0
+            }),
+        );
+        id
+    }
+
+    pub fn post_offer(
+        &mut self,
+        series_id: u64,
+        quantity: U128,
+        premium: U128,
+        taker: Option<AccountId>,
+        expires_ns: u64,
+    ) -> u64 {
+        require!(!self.config.paused, "trading paused");
+        require!(
+            self.open_offer_count < MAX_OPEN_OFFERS,
+            "offer capacity reached"
+        );
+        let maker = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let series = self.series.get(&series_id).expect("series not found").clone();
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(now < series.expiry_ns, "series expired");
+        require!(quantity.0 > 0, "quantity must be positive");
+        require!(premium.0 > 0, "premium must be positive");
+        require!(
+            expires_ns > now && expires_ns <= series.expiry_ns,
+            "invalid offer expiry"
+        );
+        if let Some(reserved) = &taker {
+            require!(*reserved != maker, "maker cannot reserve own offer");
+        }
+
+        let width = series
+            .high_strike
+            .checked_sub(series.low_strike)
+            .expect("strike width");
+        let collateral = accounting::max_payout(quantity.0, width, series.price_scale)
+            .expect("numeric overflow");
+        // Check the per-series cap before touching balances so a rejected quote
+        // cannot leave the maker's collateral half-moved.
+        let mut series_offer_ids = self
+            .series_offers
+            .get(&series_id)
+            .cloned()
+            .unwrap_or_default();
+        require!(
+            series_offer_ids.len() < MAX_OFFERS_PER_SERIES,
+            "series offer capacity reached"
+        );
+        self.debit(&maker, collateral);
+        self.total_offer_collateral = self
+            .total_offer_collateral
+            .checked_add(collateral)
+            .expect("offer total overflow");
+
+        self.open_offer_count = self
+            .open_offer_count
+            .checked_add(1)
+            .expect("offer count overflow");
+        let offer_id = self.next_offer;
+        self.next_offer = self.next_offer.checked_add(1).expect("offer overflow");
+        self.offers.insert(
+            offer_id,
+            Offer {
+                series_id,
+                maker: maker.clone(),
+                taker,
+                quantity: quantity.0,
+                premium: premium.0,
+                collateral,
+                expires_ns,
+            },
+        );
+        series_offer_ids.push(offer_id);
+        self.series_offers.insert(series_id, series_offer_ids);
+        emit(
+            "offer_posted",
+            near_sdk::serde_json::json!({
+                "offer_id": offer_id,
+                "series_id": series_id,
+                "maker": maker,
+                "collateral": collateral,
+                "premium": premium.0
+            }),
+        );
+        offer_id
+    }
+
+    pub fn cancel_offer(&mut self, offer_id: u64) {
+        let caller = env::predecessor_account_id();
+        let offer = self.offers.get(&offer_id).expect("offer not found").clone();
+        require!(offer.maker == caller, "only maker");
+
+        self.total_offer_collateral = self
+            .total_offer_collateral
+            .checked_sub(offer.collateral)
+            .expect("offer total underflow");
+        self.open_offer_count -= 1;
+        self.credit(&offer.maker, offer.collateral);
+        self.offers.remove(&offer_id);
+        self.remove_from_book(offer.series_id, offer_id);
+        emit(
+            "offer_cancelled",
+            near_sdk::serde_json::json!({
+                "offer_id": offer_id,
+                "maker": offer.maker,
+                "collateral": offer.collateral
+            }),
+        );
+    }
+
+    /// Drop expired quotes from a series' matching index. Anyone may call; it
+    /// moves no funds. The offer records stay so their makers can still cancel
+    /// and recover collateral, but sweeps stop paying for dead reads and the
+    /// per-series cap counts live quotes only. Without this, posting short-dated
+    /// offers up to the cap would permanently block a series' book.
+    pub fn prune_offers(&mut self, series_id: u64, limit: Option<u8>) -> u64 {
+        let now = env::block_timestamp();
+        let limit = usize::from(limit.unwrap_or(50).min(50));
+        let ids = match self.series_offers.get(&series_id) {
+            Some(ids) => ids.clone(),
+            None => return 0,
+        };
+        let mut removed = 0u64;
+        let mut kept: Vec<u64> = Vec::with_capacity(ids.len());
+        for offer_id in ids {
+            let expired = match self.offers.get(&offer_id) {
+                Some(offer) => offer.expires_ns <= now,
+                None => true,
+            };
+            if expired && removed < limit as u64 {
+                removed += 1;
+                continue;
+            }
+            kept.push(offer_id);
+        }
+        if removed > 0 {
+            if kept.is_empty() {
+                self.series_offers.remove(&series_id);
+            } else {
+                self.series_offers.insert(series_id, kept);
+            }
+        }
+        // Bids share the maintenance entry point: expired quotes must not sit
+        // in the book forever in either direction.
+        let mut bids_removed = 0u64;
+        if let Some(ids) = self.series_bids.get(&series_id).cloned() {
+            let mut kept_bids: Vec<u64> = Vec::with_capacity(ids.len());
+            for bid_id in ids {
+                let expired = match self.bids.get(&bid_id) {
+                    Some(bid) => bid.expires_ns <= now,
+                    None => true,
+                };
+                if expired && bids_removed < limit as u64 {
+                    bids_removed += 1;
+                    continue;
+                }
+                kept_bids.push(bid_id);
+            }
+            if bids_removed > 0 {
+                if kept_bids.is_empty() {
+                    self.series_bids.remove(&series_id);
+                } else {
+                    self.series_bids.insert(series_id, kept_bids);
+                }
+            }
+        }
+        if removed > 0 || bids_removed > 0 {
+            emit(
+                "offers_pruned",
+                near_sdk::serde_json::json!({
+                    "series_id": series_id,
+                    "offers_removed": removed,
+                    "bids_removed": bids_removed
+                }),
+            );
+        }
+        removed + bids_removed
+    }
+
+    // ---------- bids ----------
+
+    /// Rest a bid: escrow the premium you are willing to pay for a protection
+    /// ticket. A seller fills it and becomes the maker of that ticket.
+    pub fn post_bid(
+        &mut self,
+        series_id: u64,
+        quantity: U128,
+        premium: U128,
+        expires_ns: u64,
+    ) -> u64 {
+        require!(!self.config.paused, "trading paused");
+        require!(
+            self.open_bid_count < MAX_OPEN_BIDS,
+            "bid capacity reached"
+        );
+        let owner = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let series = self.series.get(&series_id).expect("series not found").clone();
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(now < series.expiry_ns, "series expired");
+        require!(quantity.0 > 0, "quantity must be positive");
+        require!(premium.0 > 0, "premium must be positive");
+        require!(
+            expires_ns > now && expires_ns <= series.expiry_ns,
+            "invalid bid expiry"
+        );
+        let mut ids = self
+            .series_bids
+            .get(&series_id)
+            .cloned()
+            .unwrap_or_default();
+        require!(
+            ids.len() < MAX_OFFERS_PER_SERIES,
+            "series bid capacity reached"
+        );
+        self.debit(&owner, premium.0);
+        self.total_bid_escrow = self
+            .total_bid_escrow
+            .checked_add(premium.0)
+            .expect("bid escrow overflow");
+        self.open_bid_count += 1;
+        let bid_id = self.next_bid;
+        self.next_bid = self.next_bid.checked_add(1).expect("bid overflow");
+        self.bids.insert(
+            bid_id,
+            Bid {
+                series_id,
+                owner: owner.clone(),
+                quantity: quantity.0,
+                premium: premium.0,
+                expires_ns,
+            },
+        );
+        ids.push(bid_id);
+        self.series_bids.insert(series_id, ids);
+        emit(
+            "bid_posted",
+            near_sdk::serde_json::json!({
+                "bid_id": bid_id,
+                "series_id": series_id,
+                "owner": owner,
+                "quantity": quantity.0,
+                "premium": premium.0
+            }),
+        );
+        bid_id
+    }
+
+    pub fn cancel_bid(&mut self, bid_id: u64) {
+        let caller = env::predecessor_account_id();
+        let bid = self.bids.get(&bid_id).expect("bid not found").clone();
+        require!(bid.owner == caller, "only bidder");
+        self.total_bid_escrow = self
+            .total_bid_escrow
+            .checked_sub(bid.premium)
+            .expect("bid escrow underflow");
+        self.open_bid_count -= 1;
+        self.credit(&bid.owner, bid.premium);
+        self.bids.remove(&bid_id);
+        self.remove_from_bid_index(bid.series_id, bid_id);
+        emit(
+            "bid_cancelled",
+            near_sdk::serde_json::json!({
+                "bid_id": bid_id,
+                "owner": bid.owner,
+                "premium": bid.premium
+            }),
+        );
+    }
+
+    /// A seller takes a resting bid: they post collateral, the bidder's
+    /// escrowed premium becomes ticket premium, and a ticket is created.
+    pub fn fill_bid(&mut self, bid_id: u64) -> u64 {
+        require!(!self.config.paused, "trading paused");
+        let maker = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let bid = self.bids.get(&bid_id).expect("bid not found").clone();
+        let series = self.series.get(&bid.series_id).expect("series not found").clone();
+        require!(now < bid.expires_ns, "bid expired");
+        require!(now < series.expiry_ns, "series expired");
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(bid.owner != maker, "bidder cannot fill own bid");
+        require!(
+            self.open_ticket_count < MAX_OPEN_TICKETS,
+            "ticket capacity reached"
+        );
+
+        let width = series
+            .high_strike
+            .checked_sub(series.low_strike)
+            .expect("strike width");
+        let collateral = accounting::max_payout(bid.quantity, width, series.price_scale)
+            .expect("numeric overflow");
+        self.debit(&maker, collateral);
+        self.total_bid_escrow = self
+            .total_bid_escrow
+            .checked_sub(bid.premium)
+            .expect("bid escrow underflow");
+        self.total_ticket_premium = self
+            .total_ticket_premium
+            .checked_add(bid.premium)
+            .expect("ticket premium overflow");
+        self.total_ticket_collateral = self
+            .total_ticket_collateral
+            .checked_add(collateral)
+            .expect("ticket total overflow");
+        self.open_bid_count -= 1;
+        self.open_ticket_count += 1;
+
+        let ticket_id = self.next_ticket;
+        self.next_ticket = self.next_ticket.checked_add(1).expect("ticket overflow");
+        self.tickets.insert(
+            ticket_id,
+            Ticket {
+                series_id: bid.series_id,
+                buyer: bid.owner.clone(),
+                maker: maker.clone(),
+                quantity: bid.quantity,
+                collateral,
+                premium: bid.premium,
+                cost: bid.premium,
+                venue_cut: 0,
+            },
+        );
+        self.note_ticket(&bid.owner, ticket_id);
+        self.note_ticket(&maker, ticket_id);
+        self.bids.remove(&bid_id);
+        self.remove_from_bid_index(bid.series_id, bid_id);
+        emit(
+            "bid_filled",
+            near_sdk::serde_json::json!({
+                "bid_id": bid_id,
+                "ticket_id": ticket_id,
+                "series_id": bid.series_id,
+                "buyer": bid.owner,
+                "maker": maker,
+                "premium": bid.premium,
+                "collateral": collateral
+            }),
+        );
+        ticket_id
+    }
+
+    pub fn fill_offer(&mut self, offer_id: u64) -> u64 {
+        require!(!self.config.paused, "trading paused");
+        let buyer = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let offer = self.offers.get(&offer_id).expect("offer not found").clone();
+        let series = self
+            .series
+            .get(&offer.series_id)
+            .expect("series not found")
+            .clone();
+
+        require!(now < offer.expires_ns, "offer expired");
+        require!(now < series.expiry_ns, "series expired");
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(
+            self.open_ticket_count < MAX_OPEN_TICKETS,
+            "ticket capacity reached"
+        );
+        require!(buyer != offer.maker, "maker cannot fill own offer");
+        if let Some(taker) = &offer.taker {
+            require!(*taker == buyer, "offer reserved for another taker");
+        }
+
+        self.debit(&buyer, offer.premium);
+        self.total_offer_collateral = self
+            .total_offer_collateral
+            .checked_sub(offer.collateral)
+            .expect("offer total underflow");
+        self.total_ticket_collateral = self
+            .total_ticket_collateral
+            .checked_add(offer.collateral)
+            .expect("ticket total overflow");
+        self.total_ticket_premium = self
+            .total_ticket_premium
+            .checked_add(offer.premium)
+            .expect("ticket premium overflow");
+        self.open_offer_count -= 1;
+        self.open_ticket_count = self
+            .open_ticket_count
+            .checked_add(1)
+            .expect("ticket count overflow");
+
+        let ticket_id = self.next_ticket;
+        self.next_ticket = self.next_ticket.checked_add(1).expect("ticket overflow");
+        self.tickets.insert(
+            ticket_id,
+            Ticket {
+                series_id: offer.series_id,
+                buyer: buyer.clone(),
+                maker: offer.maker.clone(),
+                quantity: offer.quantity,
+                collateral: offer.collateral,
+                premium: offer.premium,
+                cost: offer.premium,
+                venue_cut: 0,
+            },
+        );
+        self.note_ticket(&buyer, ticket_id);
+        self.note_ticket(&offer.maker, ticket_id);
+        self.offers.remove(&offer_id);
+        self.remove_from_book(offer.series_id, offer_id);
+        emit(
+            "offer_filled",
+            near_sdk::serde_json::json!({
+                "offer_id": offer_id,
+                "ticket_id": ticket_id,
+                "series_id": offer.series_id,
+                "buyer": buyer,
+                "maker": offer.maker,
+                "premium": offer.premium,
+                "collateral": offer.collateral
+            }),
+        );
+        ticket_id
+    }
+
+    // ---------- player vs pool ----------
+
+    /// Buy a bounded spread straight from the vault. The pool is the maker, so
+    /// there is no resting offer to take and the caller only supplies the mid
+    /// the engine marked the series at.
+    ///
+    /// Two bounds make a wrong mark survivable, and neither is trust:
+    /// - the buyer is protected by `max_total_premium`, their own slippage
+    ///   budget, and by the rule that a ticket can never cost more than the
+    ///  most it can ever pay;
+    /// - the pool is protected by its capacity invariant, so an underpriced
+    ///   mark can drain the equity LPs committed but can never make the vault
+    ///   owe more than it holds.
+    pub fn pool_buy(
+        &mut self,
+        series_id: u64,
+        quantity: U128,
+        mid_units: U128,
+        max_total_premium: U128,
+    ) -> u64 {
+        require!(!self.config.paused, "trading paused");
+        require!(quantity.0 > 0, "quantity must be positive");
+        require!(mid_units.0 > 0, "mid must be positive");
+        require!(max_total_premium.0 > 0, "premium budget must be positive");
+        let buyer = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let series = self
+            .series
+            .get(&series_id)
+            .expect("series not found")
+            .clone();
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(now < series.expiry_ns, "series expired");
+        require!(
+            self.open_ticket_count < MAX_OPEN_TICKETS,
+            "ticket capacity reached"
+        );
+
+        let width = series
+            .high_strike
+            .checked_sub(series.low_strike)
+            .expect("strike width");
+        let terms = self.terms();
+        let premium = terms
+            .entry_premium(quantity.0, mid_units.0, series.price_scale)
+            .expect("premium overflow");
+        require!(premium > 0, "premium rounded to zero");
+        require!(
+            premium <= max_total_premium.0,
+            "premium above the budget"
+        );
+        let venue_cut = terms.venue_cut(premium).expect("premium split");
+        let lp_notional = terms.lp_notional(premium).expect("premium split");
+
+        let mut vault = self.load_pool();
+        let Some(written) = vault.write(
+            quantity.0,
+            width,
+            series.price_scale,
+            lp_notional,
+            venue_cut,
+        ) else {
+            env::panic_str("pool full: this worst case does not fit the equity left");
+        };
+        // The ceiling is the written worst case itself, so a mark cannot price a
+        // ticket above its own maximum payoff.
+        require!(
+            premium <= written.max_payout,
+            "premium above the maximum payoff"
+        );
+        self.debit(&buyer, premium);
+        self.save_pool(&vault);
+
+        self.open_ticket_count += 1;
+        self.pool_tickets += 1;
+        let ticket_id = self.next_ticket;
+        self.next_ticket = self.next_ticket.checked_add(1).expect("ticket overflow");
+        self.tickets.insert(
+            ticket_id,
+            Ticket {
+                series_id,
+                buyer: buyer.clone(),
+                // The vault is the maker. No account can be its own
+                // predecessor, so this identity is unforgeable and marks the
+                // ticket as pool money for the rest of its life.
+                maker: env::current_account_id(),
+                quantity: quantity.0,
+                collateral: written.max_payout,
+                premium,
+                cost: premium,
+                venue_cut,
+            },
+        );
+        self.note_ticket(&buyer, ticket_id);
+        emit(
+            "pool_bought",
+            near_sdk::serde_json::json!({
+                "ticket_id": ticket_id,
+                "series_id": series_id,
+                "buyer": buyer,
+                "quantity": quantity.0,
+                "premium": premium,
+                "venue_cut": venue_cut,
+                "max_payout": written.max_payout,
+                "equity": vault.equity,
+                "reserved": vault.reserved
+            }),
+        );
+        ticket_id
+    }
+
+    /// Sell a pool ticket back before expiry. Unlike `close_ticket`, which hands
+    /// a position to a resting bidder and leaves the maker's obligation alone,
+    /// this destroys the position: the pool pays its marked exit value less the
+    /// impact haircut and gives back the reservation.
+    pub fn pool_close(&mut self, ticket_id: u64, mid_units: U128) -> U128 {
+        require!(!self.config.paused, "trading paused");
+        let seller = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let ticket = self.tickets.get(&ticket_id).expect("ticket not found").clone();
+        require!(
+            ticket.maker == env::current_account_id(),
+            "not a pool ticket"
+        );
+        require!(ticket.buyer == seller, "only the buyer can close a ticket");
+        let series = self
+            .series
+            .get(&ticket.series_id)
+            .expect("series not found")
+            .clone();
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(now < series.expiry_ns, "series expired");
+
+        let exit = self
+            .terms()
+            .exit_value(ticket.quantity, mid_units.0, series.price_scale)
+            .expect("exit overflow");
+        let written = self.written_of(&ticket);
+        let mut vault = self.load_pool();
+        require!(
+            vault.close(&written, exit).is_some(),
+            "pool cannot pay this exit"
+        );
+        self.save_pool(&vault);
+        self.tickets.remove(&ticket_id);
+        self.open_ticket_count -= 1;
+        self.pool_tickets -= 1;
+        self.drop_ticket(&seller, ticket_id);
+        self.credit(&seller, exit);
+        emit(
+            "pool_closed",
+            near_sdk::serde_json::json!({
+                "ticket_id": ticket_id,
+                "seller": seller,
+                "exit_value": exit,
+                "equity": vault.equity,
+                "reserved": vault.reserved
+            }),
+        );
+        U128(exit)
+    }
+
+    /// Enter the vault with money already at the venue, minting the same shares
+    /// the external `"pool-deposit"` message would. The contract holds the cash
+    /// either way, so an FT round trip would only make LPs withdraw first.
+    /// Custody is untouched by construction: one bucket shrinks as equity grows.
+    pub fn pool_deposit_from_balance(&mut self, amount: U128) -> U128 {
+        require!(!self.config.paused, "deposits paused");
+        require!(amount.0 > 0, "amount must be positive");
+        let lp = env::predecessor_account_id();
+        let mut vault = self.load_pool();
+        // Price the mint before moving anything: a deposit too small to buy a
+        // whole share keeps the caller's balance exactly where it was.
+        let Some(minted) = vault.deposit(amount.0) else {
+            env::panic_str("deposit too small to mint a share");
+        };
+        self.debit(&lp, amount.0);
+        self.save_pool(&vault);
+        let held = self.lp_shares.get(&lp).copied().unwrap_or(0);
+        self.lp_shares
+            .insert(lp.clone(), held.checked_add(minted).expect("share overflow"));
+        emit(
+            "pool_deposit",
+            near_sdk::serde_json::json!({
+                "lp": lp,
+                "amount": amount.0,
+                "shares_minted": minted,
+                "equity": vault.equity,
+                "from_balance": true
+            }),
+        );
+        U128(minted)
+    }
+
+    /// Redeem vault shares for the LP's own money. Refused when the pool cannot
+    /// free the equity without leaving a worst case uncovered, so no LP can step
+    /// in front of a settlement.
+    pub fn pool_withdraw(&mut self, shares: U128) -> U128 {
+        require!(!self.config.paused, "withdrawals paused");
+        require!(shares.0 > 0, "shares must be positive");
+        let lp = env::predecessor_account_id();
+        let held = self.lp_shares.get(&lp).copied().unwrap_or(0);
+        require!(held >= shares.0, "not enough shares");
+        let mut vault = self.load_pool();
+        let Some(amount) = vault.withdraw(shares.0) else {
+            env::panic_str("pool committed: free equity does not cover this exit");
+        };
+        self.save_pool(&vault);
+        let rest = held - shares.0;
+        if rest == 0 {
+            self.lp_shares.remove(&lp);
+        } else {
+            self.lp_shares.insert(lp.clone(), rest);
+        }
+        self.credit(&lp, amount);
+        emit(
+            "pool_withdraw",
+            near_sdk::serde_json::json!({
+                "lp": lp,
+                "shares": shares.0,
+                "amount": amount,
+                "equity": vault.equity
+            }),
+        );
+        U128(amount)
+    }
+
+    /// The venue takes its accrued margin. Only the slice on tickets that have
+    /// already run off is sweepable: while a ticket is open its margin is the
+    /// source a void refunds from, so sweeping it would strand the settlement.
+    /// Nothing here touches `equity`, so collecting fees never dilutes a share.
+    pub fn pool_sweep(&mut self) -> U128 {
+        let caller = env::predecessor_account_id();
+        require!(caller == self.venue, "only the venue");
+        let mut vault = self.load_pool();
+        let claimable = vault.sweep_venue();
+        self.save_pool(&vault);
+        if claimable > 0 {
+            self.credit(&caller, claimable);
+        }
+        emit(
+            "venue_swept",
+            near_sdk::serde_json::json!({
+                "venue": caller,
+                "amount": claimable,
+                "venue_left": vault.venue
+            }),
+        );
+        U128(claimable)
+    }
+
+    pub fn set_fee_terms(&mut self, margin_bps: u32, impact_bps: u32) {
+        self.assert_admin();
+        require!(margin_bps < fees::BASIS as u32, "margin must be below 100%");
+        require!(impact_bps < fees::BASIS as u32, "haircut must be below 100%");
+        self.margin_bps = margin_bps;
+        self.impact_bps = impact_bps;
+    }
+
+    pub fn set_venue(&mut self, venue: AccountId) {
+        self.assert_admin();
+        self.venue = venue;
+    }
+
+    // ---------- settlement ----------
+
+    pub fn request_settlement(&mut self, series_id: u64) -> Promise {
+        let now = env::block_timestamp();
+        let mut series = self.series.get(&series_id).expect("series not found").clone();
+        // A retry is allowed while a previous query is still pending: a caller
+        // with too little gas must not be able to block settlement liveness.
+        require!(
+            matches!(series.settlement, Settlement::Open | Settlement::Pending),
+            "settlement not open"
+        );
+        require!(now >= series.expiry_ns, "not expired");
+        require!(now < series.finalize_until_ns, "acceptance window over");
+
+        series.settlement = Settlement::Pending;
+        series.pending_since_ns = now;
+        self.series.insert(series_id, series.clone());
+        emit(
+            "settlement_requested",
+            near_sdk::serde_json::json!({ "series_id": series_id }),
+        );
+
+        ext_oracle::ext(self.config.oracle.clone())
+            .with_static_gas(GAS_FOR_ORACLE_QUERY)
+            .get_observations(
+                series.oracle_feed,
+                series.expiry_ns,
+                series.accept_until_ns,
+                MAX_OBSERVATIONS,
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_CALLBACK)
+                    .on_settlement_observation(series_id),
+            )
+    }
+
+    /// Fixed on the first valid observation returned in the series window.
+    /// A late or duplicate callback cannot overwrite a fixed or voided series.
+    #[private]
+    pub fn on_settlement_observation(&mut self, series_id: u64) -> bool {
+        let mut series = self.series.get(&series_id).expect("series not found").clone();
+        if series.settlement != Settlement::Pending {
+            return false;
+        }
+
+        let observations = env::promise_result_checked(0, 64 * 1024)
+            .ok()
+            .and_then(|bytes| {
+                near_sdk::serde_json::from_slice::<Vec<PriceObservation>>(&bytes).ok()
+            });
+
+        let now = env::block_timestamp();
+        let upper_bound = series.high_strike.saturating_mul(PRICE_BOUND_FACTOR);
+        let lower_bound = series.low_strike / PRICE_BOUND_FACTOR;
+        let chosen = observations.unwrap_or_default().into_iter().find(|obs| {
+            obs.price > 0
+                && obs.price >= lower_bound
+                && obs.price <= upper_bound
+                && obs.publish_time_ns <= now
+                && obs.publish_time_ns >= series.expiry_ns
+                && obs.publish_time_ns <= series.accept_until_ns
+                && obs.confidence_bps >= series.min_confidence_bps
+        });
+
+        series.settlement = match chosen {
+            Some(obs) => Settlement::Fixed {
+                price: obs.price,
+                publish_time_ns: obs.publish_time_ns,
+            },
+            None => Settlement::Open,
+        };
+        series.pending_since_ns = 0;
+        self.series.insert(series_id, series.clone());
+        emit(
+            "settlement_resolved",
+            near_sdk::serde_json::json!({
+                "series_id": series_id,
+                "settlement": series.settlement
+            }),
+        );
+        true
+    }
+
+    pub fn void_series(&mut self, series_id: u64) {
+        let now = env::block_timestamp();
+        let mut series = self.series.get(&series_id).expect("series not found").clone();
+        require!(
+            now >= series.finalize_until_ns,
+            "finalize deadline not reached"
+        );
+        match series.settlement {
+            Settlement::Open => {}
+            Settlement::Pending => require!(
+                now >= series.pending_since_ns
+                    .saturating_add(SETTLEMENT_GRACE_NS),
+                "settlement grace period"
+            ),
+            _ => env::panic_str("already fixed or voided"),
+        }
+        series.settlement = Settlement::Void;
+        series.pending_since_ns = 0;
+        self.series.insert(series_id, series);
+        emit(
+            "series_voided",
+            near_sdk::serde_json::json!({ "series_id": series_id }),
+        );
+    }
+
+    /// Pay a ticket off its series' fixed price, or unwind it if the series was
+    /// voided. A ticket whose maker is the vault settles out of pool equity
+    /// instead of a maker's escrow; the buyer's credit is the same either way.
+    pub fn settle_ticket(&mut self, ticket_id: u64) -> (U128, U128) {
+        let ticket = self.tickets.get(&ticket_id).expect("ticket not found").clone();
+        let series = self
+            .series
+            .get(&ticket.series_id)
+            .expect("series not found")
+            .clone();
+        let from_pool = ticket.maker == env::current_account_id();
+        let mut vault = self.load_pool();
+
+        let (payout, voided) = match series.settlement {
+            Settlement::Fixed { price, .. } => (
+                match series.kind {
+                    SpreadKind::Put => accounting::payout(
+                        ticket.quantity,
+                        series.price_scale,
+                        series.high_strike,
+                        series.low_strike,
+                        price,
+                    ),
+                    SpreadKind::Call => accounting::payout_call(
+                        ticket.quantity,
+                        series.price_scale,
+                        series.high_strike,
+                        series.low_strike,
+                        price,
+                    ),
+                }
+                .expect("payoff overflow"),
+                false,
+            ),
+            Settlement::Void => (0, true),
+            _ => env::panic_str("series not settled"),
+        };
+
+        let (buyer_credit, maker_credit) = if from_pool {
+            // The vault is the maker: it pays from its own equity and keeps the
+            // premium it was handed, so there is no second credit to split.
+            // A void instead unwinds the entry exactly, which is why the split
+            // is stored on the ticket rather than recomputed from today's fee.
+            let written = self.written_of(&ticket);
+            if voided {
+                require!(
+                    vault.void_out(&written).is_some(),
+                    "pool cannot unwind this ticket"
+                );
+                (ticket.premium, 0)
+            } else {
+                require!(
+                    vault.settle(&written, payout).is_some(),
+                    "pool cannot settle this ticket"
+                );
+                (payout, 0)
+            }
+        } else {
+            accounting::split_settlement(ticket.collateral, ticket.premium, payout, voided)
+                .expect("settlement accounting")
+        };
+        self.save_pool(&vault);
+        self.open_ticket_count -= 1;
+        if from_pool {
+            self.pool_tickets -= 1;
+        } else {
+            self.total_ticket_collateral = self
+                .total_ticket_collateral
+                .checked_sub(ticket.collateral)
+                .expect("ticket collateral underflow");
+            self.total_ticket_premium = self
+                .total_ticket_premium
+                .checked_sub(ticket.premium)
+                .expect("ticket premium underflow");
+        }
+        self.tickets.remove(&ticket_id);
+        self.drop_ticket(&ticket.buyer, ticket_id);
+        self.drop_ticket(&ticket.maker, ticket_id);
+        self.credit(&ticket.buyer, buyer_credit);
+        self.credit(&ticket.maker, maker_credit);
+        emit(
+            "ticket_settled",
+            near_sdk::serde_json::json!({
+                "ticket_id": ticket_id,
+                "series_id": ticket.series_id,
+                "buyer": ticket.buyer,
+                "maker": ticket.maker,
+                "buyer_credit": buyer_credit,
+                "maker_credit": maker_credit,
+                "voided": voided,
+                "pool": from_pool
+            }),
+        );
+        (U128(buyer_credit), U128(maker_credit))
+    }
+
+    /// Close a long ticket by selling it into the best resting bid on its
+    /// series. The bidder's escrowed premium pays the exiting buyer and the
+    /// bidder takes the ticket over; the maker's collateral never moves, so a
+    /// close leaves the custody sum exactly as it was.
+    ///
+    /// Whole positions only: a bid for a different size cannot absorb the
+    /// ticket without splitting it, and this contract does not split.
+    pub fn close_ticket(&mut self, ticket_id: u64, min_unit_premium: Option<U128>) -> U128 {
+        require!(!self.config.paused, "trading paused");
+        let seller = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let ticket = self.tickets.get(&ticket_id).expect("ticket not found").clone();
+        require!(ticket.buyer == seller, "only the buyer can close a ticket");
+        let series = self
+            .series
+            .get(&ticket.series_id)
+            .expect("series not found")
+            .clone();
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(now < series.expiry_ns, "series expired");
+
+        let Some(bid) = self
+            .get_bids(ticket.series_id, 50)
+            .into_iter()
+            .find(|bid| bid.owner != seller && bid.quantity.0 == ticket.quantity)
+        else {
+            env::panic_str("no resting bid for this whole ticket");
+        };
+        if let Some(min) = min_unit_premium {
+            require!(
+                bid.unit_premium.0 >= min.0,
+                "close below the minimum unit premium"
+            );
+        }
+
+        self.total_bid_escrow = self
+            .total_bid_escrow
+            .checked_sub(bid.premium.0)
+            .expect("bid escrow underflow");
+        self.open_bid_count -= 1;
+        self.bids.remove(&bid.bid_id);
+        self.remove_from_bid_index(ticket.series_id, bid.bid_id);
+        self.credit(&seller, bid.premium.0);
+        self.drop_ticket(&seller, ticket_id);
+        self.note_ticket(&bid.owner, ticket_id);
+
+        let taker = ticket.buyer.clone();
+        let closed = Ticket {
+            buyer: bid.owner.clone(),
+            cost: bid.premium.0,
+            ..ticket.clone()
+        };
+        self.tickets.insert(ticket_id, closed);
+        emit(
+            "ticket_closed",
+            near_sdk::serde_json::json!({
+                "ticket_id": ticket_id,
+                "series_id": ticket.series_id,
+                "seller": taker,
+                "new_buyer": bid.owner,
+                "bid_id": bid.bid_id,
+                "proceeds": bid.premium.0,
+                "unit_premium": bid.unit_premium.0
+            }),
+        );
+        U128(bid.premium.0)
+    }
+
+    /// Every ticket an account is exposed to, long or short, with the cost
+    /// basis and the series terms needed to mark it. PnL is computed by the
+    /// caller against a live price; the contract only states facts.
+    pub fn get_positions(&self, account: AccountId, limit: u8) -> Vec<PositionView> {
+        let ids = self.holder_tickets.get(&account).cloned().unwrap_or_default();
+        let mut rows = ids
+            .into_iter()
+            .filter_map(|ticket_id| {
+                let ticket = self.tickets.get(&ticket_id).cloned()?;
+                let holder = if ticket.buyer == account {
+                    "long"
+                } else if ticket.maker == account {
+                    "short"
+                } else {
+                    return None;
+                };
+                let series = self.series.get(&ticket.series_id)?;
+                Some(PositionView {
+                    ticket_id,
+                    series_id: ticket.series_id,
+                    side: holder.to_string(),
+                    maker: ticket.maker.clone(),
+                    quantity: U128(ticket.quantity),
+                    cost: U128(ticket.cost),
+                    premium: U128(ticket.premium),
+                    collateral: U128(ticket.collateral),
+                    kind: series.kind.clone(),
+                    underlying: series.underlying.clone(),
+                    low_strike: U128(series.low_strike),
+                    high_strike: U128(series.high_strike),
+                    price_scale: U128(series.price_scale),
+                    expiry_ns: series.expiry_ns,
+                    settlement: format!("{:?}", series.settlement),
+                    fixed_price: match series.settlement {
+                        Settlement::Fixed { price, .. } => Some(U128(price)),
+                        _ => None,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.ticket_id);
+        rows.truncate(limit.min(100) as usize);
+        rows
+    }
+
+    // ---------- callbacks ----------
+
+    #[private]
+    pub fn on_withdraw(&mut self, withdrawal_id: u64) -> String {
+        let mut withdrawal = self
+            .withdrawals
+            .get(&withdrawal_id)
+            .expect("withdrawal not found")
+            .clone();
+        require!(
+            withdrawal.status == WithdrawalStatus::Pending,
+            "withdrawal already resolved"
+        );
+
+        let owner = withdrawal.owner.clone();
+        let mut resolved = false;
+        match env::promise_result_checked(0, 64 * 1024) {
+            Ok(_) => {
+                self.total_pending_withdrawals = self
+                    .total_pending_withdrawals
+                    .checked_sub(withdrawal.amount)
+                    .expect("pending total underflow");
+                withdrawal.status = WithdrawalStatus::Succeeded;
+                resolved = true;
+            }
+            Err(near_sdk::PromiseError::Failed) => {
+                self.total_pending_withdrawals = self
+                    .total_pending_withdrawals
+                    .checked_sub(withdrawal.amount)
+                    .expect("pending total underflow");
+                withdrawal.status = WithdrawalStatus::Failed;
+                self.credit(&withdrawal.owner, withdrawal.amount);
+                resolved = true;
+            }
+            // An oversized or future error variant means the transfer may have
+            // succeeded. Keep the debit and pending record rather than risk a
+            // double credit.
+            Err(_) => {}
+        }
+
+        if resolved {
+            self.withdrawals.remove(&withdrawal_id);
+            self.pending_withdrawal_count -= 1;
+            let mut ids = self
+                .owner_withdrawals
+                .get(&owner)
+                .cloned()
+                .unwrap_or_default();
+            ids.retain(|id| *id != withdrawal_id);
+            if ids.is_empty() {
+                self.owner_withdrawals.remove(&owner);
+            } else {
+                self.owner_withdrawals.insert(owner, ids);
+            }
+            emit(
+                "withdrawal_resolved",
+                near_sdk::serde_json::json!({
+                    "withdrawal_id": withdrawal_id,
+                    "owner": withdrawal.owner,
+                    "amount": withdrawal.amount,
+                    "status": withdrawal.status
+                }),
+            );
+        } else {
+            self.withdrawals.insert(withdrawal_id, withdrawal.clone());
+        }
+        format!("{:?}", withdrawal.status)
+    }
+
+    // ---------- administration ----------
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.assert_admin();
+        self.config.paused = paused;
+    }
+
+    // ---------- views ----------
+
+    pub fn get_config(&self) -> Config {
+        self.config.clone()
+    }
+
+    pub fn get_series(&self, series_id: u64) -> Option<Series> {
+        self.series.get(&series_id).cloned()
+    }
+
+    pub fn get_offer(&self, offer_id: u64) -> Option<Offer> {
+        self.offers.get(&offer_id).cloned()
+    }
+
+    pub fn get_ticket(&self, ticket_id: u64) -> Option<Ticket> {
+        self.tickets.get(&ticket_id).cloned()
+    }
+
+    pub fn get_balance(&self, account_id: AccountId) -> U128 {
+        U128(self.balances.get(&account_id).copied().unwrap_or(0))
+    }
+
+    pub fn get_withdrawal(&self, withdrawal_id: u64) -> Option<Withdrawal> {
+        self.withdrawals.get(&withdrawal_id).cloned()
+    }
+
+    pub fn get_pool_state(&self) -> PoolState {
+        let vault = self.load_pool();
+        PoolState {
+            equity: U128(vault.equity),
+            reserved: U128(vault.reserved),
+            venue_locked: U128(vault.venue_locked),
+            venue: U128(vault.venue),
+            consolation: U128(vault.consolation),
+            shares: U128(vault.shares),
+            free_equity: U128(vault.free_equity()),
+            utilisation_bps: U128(vault.utilisation_bps()),
+            open_tickets: self.pool_tickets,
+            venue_account: self.venue.clone(),
+            margin_bps: self.margin_bps,
+            impact_bps: self.impact_bps,
+        }
+    }
+
+    pub fn get_lp_shares(&self, account_id: AccountId) -> U128 {
+        U128(self.lp_shares.get(&account_id).copied().unwrap_or(0))
+    }
+
+    /// What an LP balance redeems at the current NAV — `pool_withdraw`'s own
+    /// arithmetic, read-only. A screen that estimated this itself would be
+    /// quoting an exit the contract might not pay.
+    pub fn get_lp_value(&self, account_id: AccountId) -> U128 {
+        let vault = self.load_pool();
+        U128(vault.exit_value(self.lp_shares.get(&account_id).copied().unwrap_or(0)))
+    }
+
+    pub fn get_owner_withdrawals(&self, owner: AccountId) -> Vec<u64> {
+        self.owner_withdrawals.get(&owner).cloned().unwrap_or_default()
+    }
+
+    pub fn stats(&self) -> Stats {
+        Stats {
+            series_count: self.next_series,
+            offer_count: self.next_offer,
+            ticket_count: self.next_ticket,
+            withdrawal_count: self.next_withdrawal,
+            open_offer_count: self.open_offer_count,
+            open_bid_count: self.open_bid_count,
+            open_ticket_count: self.open_ticket_count,
+            pending_withdrawal_count: self.pending_withdrawal_count,
+            total_available: U128(self.total_available),
+            total_offer_collateral: U128(self.total_offer_collateral),
+            total_bid_escrow: U128(self.total_bid_escrow),
+            total_ticket_collateral: U128(self.total_ticket_collateral),
+            total_ticket_premium: U128(self.total_ticket_premium),
+            total_pending_withdrawals: U128(self.total_pending_withdrawals),
+        }
+    }
+
+    /// Sum that must equal the contract's FT balance between asynchronous
+    /// transfers. Exposed so tests and operators can reconcile custody.
+    ///
+    /// The vault is part of that balance, and its own buckets are the only
+    /// place its money is counted: a ticket the pool wrote contributes nothing
+    /// to `total_ticket_collateral` or `total_ticket_premium`, because the
+    /// premium it collected already moved into `equity` and `venue` at entry.
+    pub fn expected_custody(&self) -> U128 {
+        U128(
+            self.total_available
+                .checked_add(self.total_offer_collateral)
+                .and_then(|v| v.checked_add(self.total_bid_escrow))
+                .and_then(|v| v.checked_add(self.total_ticket_collateral))
+                .and_then(|v| v.checked_add(self.total_ticket_premium))
+                .and_then(|v| v.checked_add(self.total_pending_withdrawals))
+                .and_then(|v| v.checked_add(self.load_pool().expected_custody()))
+                .expect("custody overflow"),
+        )
+    }
+
+    // ---------- market orders ----------
+
+    /// Sweep whole offers from cheapest to dearest until the requested size or
+    /// the worst-case premium budget is exhausted. Offers larger than the
+    /// remaining size, reserved for another taker, expired, or authored by the
+    /// buyer are skipped rather than partially taken.
+    pub fn fill_market_order(
+        &mut self,
+        series_id: u64,
+        quantity: U128,
+        max_total_premium: U128,
+        min_quantity: Option<U128>,
+    ) -> MarketFill {
+        require!(!self.config.paused, "trading paused");
+        require!(quantity.0 > 0, "quantity must be positive");
+        require!(max_total_premium.0 > 0, "premium budget must be positive");
+        let buyer = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let series = self.series.get(&series_id).expect("series not found").clone();
+        require!(series.settlement == Settlement::Open, "series not open");
+        require!(now < series.expiry_ns, "series expired");
+        require!(
+            self.open_ticket_count < MAX_OPEN_TICKETS,
+            "ticket capacity reached"
+        );
+
+        let mut candidates: Vec<(Offer, u64)> = Vec::new();
+        for offer_id in self
+            .series_offers
+            .get(&series_id)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let Some(offer) = self.offers.get(&offer_id).cloned() else {
+                continue;
+            };
+            if offer.maker == buyer
+                || now >= offer.expires_ns
+                || offer.quantity > quantity.0
+                || offer.premium > max_total_premium.0
+            {
+                continue;
+            }
+            if let Some(reserved) = &offer.taker {
+                if *reserved != buyer {
+                    continue;
+                }
+            }
+            candidates.push((offer, offer_id));
+        }
+        // Sort on the scaled unit premium (1e6 precision) with offer id as the
+        // tie-break: a provably total order, unlike cross-multiplication that
+        // can overflow and hand `sort_by` an inconsistent comparator.
+        candidates.sort_by(|(a, a_id), (b, b_id)| {
+            unit_premium(a)
+                .cmp(&unit_premium(b))
+                .then_with(|| a_id.cmp(b_id))
+        });
+
+        let mut remaining = quantity.0;
+        let mut budget = max_total_premium.0;
+        let mut chosen: Vec<(Offer, u64)> = Vec::new();
+        for (offer, offer_id) in candidates {
+            if remaining == 0 {
+                break;
+            }
+            if offer.quantity > remaining || offer.premium > budget {
+                continue;
+            }
+            remaining -= offer.quantity;
+            budget -= offer.premium;
+            chosen.push((offer, offer_id));
+        }
+
+        let filled_quantity = quantity.0 - remaining;
+        let total_premium = max_total_premium.0 - budget;
+        require!(filled_quantity > 0, "no matching offers");
+        require!(
+            filled_quantity >= min_quantity.map(|value| value.0).unwrap_or(1),
+            "minimum quantity not filled"
+        );
+        let projected_tickets = self
+            .open_ticket_count
+            .saturating_add(chosen.len() as u64);
+        require!(
+            projected_tickets <= MAX_OPEN_TICKETS,
+            "ticket capacity reached"
+        );
+        self.debit(&buyer, total_premium);
+
+        let mut tickets = Vec::with_capacity(chosen.len());
+        let mut worst_unit_premium = 0u128;
+        let mut taken_ids = Vec::with_capacity(chosen.len());
+        for (offer, offer_id) in chosen {
+            worst_unit_premium = worst_unit_premium.max(unit_premium(&offer));
+            self.total_offer_collateral = self
+                .total_offer_collateral
+                .checked_sub(offer.collateral)
+                .expect("offer total underflow");
+            self.open_offer_count -= 1;
+            self.offers.remove(&offer_id);
+            taken_ids.push(offer_id);
+
+            self.total_ticket_collateral = self
+                .total_ticket_collateral
+                .checked_add(offer.collateral)
+                .expect("ticket total overflow");
+            self.total_ticket_premium = self
+                .total_ticket_premium
+                .checked_add(offer.premium)
+                .expect("ticket premium overflow");
+            self.open_ticket_count = self
+                .open_ticket_count
+                .checked_add(1)
+                .expect("ticket count overflow");
+
+            let ticket_id = self.next_ticket;
+            self.next_ticket = self.next_ticket.checked_add(1).expect("ticket overflow");
+            self.tickets.insert(
+                ticket_id,
+                Ticket {
+                    series_id: offer.series_id,
+                    buyer: buyer.clone(),
+                    maker: offer.maker.clone(),
+                    quantity: offer.quantity,
+                    collateral: offer.collateral,
+                    premium: offer.premium,
+                    cost: offer.premium,
+                    venue_cut: 0,
+                },
+            );
+            self.note_ticket(&buyer, ticket_id);
+            self.note_ticket(&offer.maker, ticket_id);
+            tickets.push(ticket_id);
+            // One per-offer record, shaped like fill_offer's event, so a maker
+            // can recover what it sold from the log alone.
+            emit(
+                "offer_filled",
+                near_sdk::serde_json::json!({
+                    "offer_id": offer_id,
+                    "ticket_id": ticket_id,
+                    "series_id": offer.series_id,
+                    "buyer": buyer,
+                    "maker": offer.maker,
+                    "premium": offer.premium,
+                    "collateral": offer.collateral,
+                    "swept": true
+                }),
+            );
+        }
+        self.remove_many_from_book(series_id, &taken_ids);
+
+        let fill = MarketFill {
+            tickets,
+            filled_quantity: U128(filled_quantity),
+            total_premium: U128(total_premium),
+            unfilled_quantity: U128(remaining),
+            worst_unit_premium: U128(worst_unit_premium),
+        };
+        emit(
+            "market_order_filled",
+            near_sdk::serde_json::json!({
+                "series_id": series_id,
+                "buyer": buyer,
+                "filled_quantity": filled_quantity,
+                "total_premium": total_premium,
+                "unfilled_quantity": remaining,
+                "worst_unit_premium": worst_unit_premium,
+                "tickets": fill.tickets
+            }),
+        );
+        fill
+    }
+
+    pub fn get_book(&self, series_id: u64, limit: u8) -> Vec<BookOffer> {
+        let now = env::block_timestamp();
+        let mut offers: Vec<BookOffer> = self
+            .series_offers
+            .get(&series_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|offer_id| {
+                let offer = self.offers.get(&offer_id).cloned()?;
+                (now < offer.expires_ns).then_some(BookOffer {
+                    offer_id,
+                    maker: offer.maker.clone(),
+                    quantity: U128(offer.quantity),
+                    premium: U128(offer.premium),
+                    unit_premium: U128(unit_premium(&offer)),
+                    taker: offer.taker,
+                    expires_ns: offer.expires_ns,
+                })
+            })
+            .collect();
+        // Same order the sweep uses, so what a UI shows is what it will pay.
+        offers.sort_by(|a, b| {
+            a.unit_premium
+                .0
+                .cmp(&b.unit_premium.0)
+                .then_with(|| a.offer_id.cmp(&b.offer_id))
+        });
+        offers.truncate(limit.min(50) as usize);
+        offers
+    }
+
+    /// Resting bids for a series, best (highest premium per unit) first.
+    pub fn get_bids(&self, series_id: u64, limit: u8) -> Vec<BidView> {
+        let now = env::block_timestamp();
+        let mut bids: Vec<BidView> = self
+            .series_bids
+            .get(&series_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|bid_id| {
+                let bid = self.bids.get(&bid_id).cloned()?;
+                (now < bid.expires_ns).then_some(BidView {
+                    bid_id,
+                    owner: bid.owner,
+                    quantity: U128(bid.quantity),
+                    premium: U128(bid.premium),
+                    unit_premium: U128(premium_per_unit(bid.premium, bid.quantity)),
+                    expires_ns: bid.expires_ns,
+                })
+            })
+            .collect();
+        bids.sort_by(|a, b| {
+            b.unit_premium
+                .0
+                .cmp(&a.unit_premium.0)
+                .then_with(|| a.bid_id.cmp(&b.bid_id))
+        });
+        bids.truncate(limit.min(50) as usize);
+        bids
+    }
+
+    // ---------- internals ----------
+
+    /// Rebuild the vault from its fields. `Pool` lives in the chain-safe
+    /// crate and knows nothing about storage, so the contract owns only this
+    /// translation.
+    fn load_pool(&self) -> Pool {
+        Pool {
+            equity: self.pool_equity,
+            reserved: self.pool_reserved,
+            venue_locked: self.pool_venue_locked,
+            venue: self.pool_venue,
+            consolation: self.pool_consolation,
+            shares: self.pool_shares,
+        }
+    }
+
+    fn save_pool(&mut self, vault: &Pool) {
+        self.pool_equity = vault.equity;
+        self.pool_reserved = vault.reserved;
+        self.pool_venue_locked = vault.venue_locked;
+        self.pool_venue = vault.venue;
+        self.pool_consolation = vault.consolation;
+        self.pool_shares = vault.shares;
+    }
+
+    /// The vault's record of a position, rebuilt from the ticket. `premium` and
+    /// `venue_cut` are what was actually collected, so this is the same split
+    /// `pool_buy` made even if the fee terms have moved since.
+    fn written_of(&self, ticket: &Ticket) -> Written {
+        Written {
+            max_payout: ticket.collateral,
+            lp_notional: ticket
+                .premium
+                .checked_sub(ticket.venue_cut)
+                .expect("premium split"),
+            venue_cut: ticket.venue_cut,
+        }
+    }
+
+    fn terms(&self) -> fees::Terms {
+        fees::Terms {
+            margin_bps: self.margin_bps,
+            impact_bps: self.impact_bps,
+        }
+    }
+
+    fn assert_admin(&self) {
+        require!(
+            env::predecessor_account_id() == self.config.admin,
+            "only admin"
+        );
+    }
+
+    fn credit(&mut self, account: &AccountId, amount: u128) {
+        if amount == 0 {
+            return;
+        }
+        let balance = self.balances.get(account).copied().unwrap_or(0);
+        let updated = balance.checked_add(amount).expect("balance overflow");
+        self.balances.insert(account.clone(), updated);
+        self.total_available = self
+            .total_available
+            .checked_add(amount)
+            .expect("available total overflow");
+    }
+
+    fn remove_from_book(&mut self, series_id: u64, offer_id: u64) {
+        let Some(mut ids) = self.series_offers.get(&series_id).cloned() else {
+            return;
+        };
+        ids.retain(|id| *id != offer_id);
+        if ids.is_empty() {
+            self.series_offers.remove(&series_id);
+        } else {
+            self.series_offers.insert(series_id, ids);
+        }
+    }
+
+    fn note_ticket(&mut self, account: &AccountId, ticket_id: u64) {
+        let mut ids = self.holder_tickets.get(account).cloned().unwrap_or_default();
+        if !ids.contains(&ticket_id) {
+            ids.push(ticket_id);
+            self.holder_tickets.insert(account.clone(), ids);
+        }
+    }
+
+    fn drop_ticket(&mut self, account: &AccountId, ticket_id: u64) {
+        let Some(ids) = self.holder_tickets.get(account).cloned() else {
+            return;
+        };
+        let kept: Vec<u64> = ids.into_iter().filter(|id| *id != ticket_id).collect();
+        if kept.is_empty() {
+            self.holder_tickets.remove(account);
+        } else {
+            self.holder_tickets.insert(account.clone(), kept);
+        }
+    }
+
+    fn remove_from_bid_index(&mut self, series_id: u64, bid_id: u64) {
+        let Some(mut ids) = self.series_bids.get(&series_id).cloned() else {
+            return;
+        };
+        ids.retain(|id| *id != bid_id);
+        if ids.is_empty() {
+            self.series_bids.remove(&series_id);
+        } else {
+            self.series_bids.insert(series_id, ids);
+        }
+    }
+
+    /// One read and one write of the index for a whole sweep.
+    fn remove_many_from_book(&mut self, series_id: u64, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let Some(current) = self.series_offers.get(&series_id).cloned() else {
+            return;
+        };
+        let kept: Vec<u64> = current
+            .into_iter()
+            .filter(|id| !ids.contains(id))
+            .collect();
+        if kept.is_empty() {
+            self.series_offers.remove(&series_id);
+        } else {
+            self.series_offers.insert(series_id, kept);
+        }
+    }
+
+    fn debit(&mut self, account: &AccountId, amount: u128) {
+        let balance = self.balances.get(account).copied().unwrap_or(0);
+        require!(balance >= amount, "insufficient available balance");
+        self.balances.insert(account.clone(), balance - amount);
+        self.total_available = self
+            .total_available
+            .checked_sub(amount)
+            .expect("available total underflow");
+    }
+}
+
+fn premium_per_unit(premium: u128, quantity: u128) -> u128 {
+    premium
+        .checked_mul(UNIT_PRECISION)
+        .and_then(|value| value.checked_div(quantity))
+        .unwrap_or(u128::MAX)
+}
+
+fn unit_premium(offer: &Offer) -> u128 {
+    premium_per_unit(offer.premium, offer.quantity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+    use near_sdk::NearToken;
+
+    fn outsider() -> AccountId {
+        "outsider.testnet".parse().unwrap()
+    }
+
+    const SCALE: u128 = 1_000_000;
+    const T0: u64 = 1_700_000_000_000_000_000;
+    /// The contract's own account. A pool-written ticket is the only ticket
+    /// whose maker is this id, so the tests need it fixed rather than defaulted.
+    /// Outside the six `accounts()` names, so it can never also be a user.
+    fn vault_account() -> AccountId {
+        "vault.testnet".parse().unwrap()
+    }
+
+    fn context(predecessor: AccountId, timestamp: u64) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(vault_account())
+            .predecessor_account_id(predecessor)
+            .block_timestamp(timestamp)
+            .attached_deposit(NearToken::from_yoctonear(0));
+        builder
+    }
+
+    fn setup() -> Contract {
+        testing_env!(context(accounts(0), T0).build());
+        Contract::new(accounts(0), accounts(1), accounts(2))
+    }
+
+    fn fund(contract: &mut Contract, account: AccountId, amount: u128) {
+        testing_env!(context(accounts(1), T0).build());
+        let unused = contract.ft_on_transfer(account, U128(amount), "deposit".to_string());
+        assert_eq!(unused, "0");
+    }
+
+    fn deposit_to_pool(contract: &mut Contract, lp: AccountId, amount: u128) {
+        testing_env!(context(accounts(1), T0).build());
+        let unused = contract.ft_on_transfer(lp, U128(amount), "pool-deposit".to_string());
+        assert_eq!(unused, "0");
+    }
+
+    /// Any positive balance moves the venue's earned margin to the venue account.
+    fn sweep(contract: &mut Contract) -> u128 {
+        testing_env!(context(accounts(0), T0).build());
+        contract.pool_sweep().0
+    }
+
+    fn series(contract: &mut Contract) -> u64 {
+        testing_env!(context(accounts(0), T0).build());
+        contract.create_series(
+            "ETH".to_string(),
+            SpreadKind::Put,
+            T0 + 60_000_000_000,
+            T0 + 120_000_000_000,
+            T0 + 660_000_000_000,
+            U128(100 * SCALE),
+            U128(110 * SCALE),
+            U128(SCALE),
+            5_000,
+            "ETH-USD".to_string(),
+        )
+    }
+
+    #[test]
+    fn rejects_deposits_from_wrong_token() {
+        let mut contract = setup();
+        testing_env!(context(outsider(), T0).build());
+        assert_eq!(
+            contract.ft_on_transfer(accounts(3), U128(1_000_000), "deposit".to_string()),
+            "1000000"
+        );
+        assert_eq!(contract.get_balance(accounts(3)).0, 0);
+    }
+
+    #[test]
+    fn fill_reserves_both_sides_and_settles_exactly() {
+        let mut contract = setup();
+        let series_id = series(&mut contract);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        fund(&mut contract, accounts(4), 100 * SCALE);
+
+        testing_env!(context(accounts(4), T0).build());
+        let offer_id = contract.post_offer(
+            series_id,
+            U128(SCALE),
+            U128(3 * SCALE),
+            None,
+            T0 + 30_000_000_000,
+        );
+        assert_eq!(contract.get_balance(accounts(4)).0, 90 * SCALE);
+
+        testing_env!(context(accounts(3), T0).build());
+        let ticket_id = contract.fill_offer(offer_id);
+        assert_eq!(contract.get_balance(accounts(3)).0, 97 * SCALE);
+        assert_eq!(contract.stats().total_ticket_collateral.0, 10 * SCALE);
+        assert_eq!(contract.stats().total_ticket_premium.0, 3 * SCALE);
+        assert_eq!(contract.expected_custody().0, 200 * SCALE);
+
+        let mut fixed = contract.get_series(series_id).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(series_id, fixed);
+
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        let (buyer, maker) = contract.settle_ticket(ticket_id);
+        assert_eq!(buyer.0, 5 * SCALE);
+        assert_eq!(maker.0, 8 * SCALE);
+        assert_eq!(contract.get_balance(accounts(3)).0, 102 * SCALE);
+        assert_eq!(contract.get_balance(accounts(4)).0, 98 * SCALE);
+        assert_eq!(contract.expected_custody().0, 200 * SCALE);
+        assert_eq!(contract.stats().total_ticket_collateral.0, 0);
+        assert_eq!(contract.stats().total_ticket_premium.0, 0);
+    }
+
+    #[test]
+    fn void_refunds_premium_and_collateral() {
+        let mut contract = setup();
+        let series_id = series(&mut contract);
+        fund(&mut contract, accounts(3), 20 * SCALE);
+        fund(&mut contract, accounts(4), 20 * SCALE);
+        testing_env!(context(accounts(4), T0).build());
+        let offer_id = contract.post_offer(
+            series_id,
+            U128(SCALE),
+            U128(2 * SCALE),
+            None,
+            T0 + 30_000_000_000,
+        );
+        testing_env!(context(accounts(3), T0).build());
+        let ticket_id = contract.fill_offer(offer_id);
+
+        testing_env!(context(outsider(), T0 + 700_000_000_000).build());
+        contract.void_series(series_id);
+        contract.settle_ticket(ticket_id);
+        assert_eq!(contract.get_balance(accounts(3)).0, 20 * SCALE);
+        assert_eq!(contract.get_balance(accounts(4)).0, 20 * SCALE);
+        assert_eq!(contract.expected_custody().0, 40 * SCALE);
+    }
+
+    #[test]
+    fn pause_blocks_risk_actions_but_not_settlement() {
+        let mut contract = setup();
+        let series_id = series(&mut contract);
+        fund(&mut contract, accounts(3), 20 * SCALE);
+        fund(&mut contract, accounts(4), 20 * SCALE);
+        testing_env!(context(accounts(4), T0).build());
+        let offer_id = contract.post_offer(
+            series_id,
+            U128(SCALE),
+            U128(2 * SCALE),
+            None,
+            T0 + 30_000_000_000,
+        );
+        testing_env!(context(accounts(3), T0).build());
+        let ticket_id = contract.fill_offer(offer_id);
+
+        testing_env!(context(accounts(0), T0).build());
+        contract.set_paused(true);
+        testing_env!(context(accounts(4), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.post_offer(
+                series_id,
+                U128(SCALE),
+                U128(2 * SCALE),
+                None,
+                T0 + 30_000_000_000,
+            )
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.withdraw(U128(SCALE))
+        }))
+        .is_err());
+
+        let mut fixed = contract.get_series(series_id).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(series_id, fixed);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        contract.settle_ticket(ticket_id);
+        assert_eq!(contract.get_balance(accounts(3)).0, 23 * SCALE);
+    }
+
+    #[test]
+    fn cannot_fill_expired_or_duplicate_offers() {
+        let mut contract = setup();
+        let series_id = series(&mut contract);
+        fund(&mut contract, accounts(3), 20 * SCALE);
+        fund(&mut contract, accounts(4), 20 * SCALE);
+        testing_env!(context(accounts(4), T0).build());
+        let offer_id = contract.post_offer(
+            series_id,
+            U128(SCALE),
+            U128(2 * SCALE),
+            None,
+            T0 + 30_000_000_000,
+        );
+        testing_env!(context(accounts(3), T0).build());
+        contract.fill_offer(offer_id);
+        testing_env!(context(accounts(3), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.fill_offer(offer_id)
+        }))
+        .is_err());
+    }
+
+    fn call_series(contract: &mut Contract) -> u64 {
+        testing_env!(context(accounts(0), T0).build());
+        contract.create_series(
+            "ETH".to_string(),
+            SpreadKind::Call,
+            T0 + 60_000_000_000,
+            T0 + 120_000_000_000,
+            T0 + 660_000_000_000,
+            U128(100 * SCALE),
+            U128(110 * SCALE),
+            U128(SCALE),
+            5_000,
+            "ETH-USD".to_string(),
+        )
+    }
+
+    fn post(
+        contract: &mut Contract,
+        series_id: u64,
+        maker: AccountId,
+        quantity: u128,
+        premium: u128,
+        taker: Option<AccountId>,
+        expires_ns: u64,
+    ) -> u64 {
+        testing_env!(context(maker, T0).build());
+        contract.post_offer(series_id, U128(quantity), U128(premium), taker, expires_ns)
+    }
+
+    #[test]
+    fn market_order_sweeps_by_unit_premium_not_absolute() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        fund(&mut contract, accounts(3), 200 * SCALE);
+        fund(&mut contract, accounts(4), 200 * SCALE);
+        fund(&mut contract, accounts(5), 200 * SCALE);
+
+        // Dear in absolute terms but cheap per unit: unit premium 3.
+        let big = post(
+            &mut contract,
+            sid,
+            accounts(4),
+            10 * SCALE,
+            30 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        // Cheap in absolute terms but dear per unit: unit premium 4.
+        let small = post(
+            &mut contract,
+            sid,
+            accounts(5),
+            SCALE,
+            4 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+
+        testing_env!(context(accounts(3), T0).build());
+        let fill = contract.fill_market_order(
+            sid,
+            U128(11 * SCALE),
+            U128(40 * SCALE),
+            Some(U128(11 * SCALE)),
+        );
+        assert_eq!(fill.filled_quantity.0, 11 * SCALE);
+        assert_eq!(fill.unfilled_quantity.0, 0);
+        assert_eq!(fill.total_premium.0, 34 * SCALE);
+        assert_eq!(fill.worst_unit_premium.0, 4 * SCALE);
+        assert_eq!(fill.tickets, vec![0, 1]);
+        assert!(contract.get_offer(big).is_none());
+        assert!(contract.get_offer(small).is_none());
+        assert_eq!(contract.stats().open_ticket_count, 2);
+        assert_eq!(contract.get_balance(accounts(3)).0, 200 * SCALE - 34 * SCALE);
+        assert_eq!(contract.expected_custody().0, 600 * SCALE);
+    }
+
+    #[test]
+    fn market_order_stops_at_premium_budget_and_reports_slippage() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        for id in [3usize, 4, 5] {
+            fund(&mut contract, accounts(id), 100 * SCALE);
+        }
+        post(
+            &mut contract,
+            sid,
+            accounts(4),
+            SCALE,
+            2 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        post(
+            &mut contract,
+            sid,
+            accounts(5),
+            SCALE,
+            9 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+
+        testing_env!(context(accounts(3), T0).build());
+        let fill = contract.fill_market_order(sid, U128(2 * SCALE), U128(5 * SCALE), None);
+        assert_eq!(fill.filled_quantity.0, SCALE);
+        assert_eq!(fill.unfilled_quantity.0, SCALE);
+        assert_eq!(fill.total_premium.0, 2 * SCALE);
+        assert_eq!(fill.worst_unit_premium.0, 2 * SCALE);
+        assert_eq!(fill.tickets.len(), 1);
+        assert_eq!(contract.get_book(sid, 50).len(), 1);
+        assert_eq!(contract.expected_custody().0, 300 * SCALE);
+    }
+
+    #[test]
+    fn market_order_skips_reserved_expired_and_own_offers() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        for id in [3usize, 4, 5] {
+            fund(&mut contract, accounts(id), 100 * SCALE);
+        }
+        let live = post(
+            &mut contract,
+            sid,
+            accounts(4),
+            SCALE,
+            2 * SCALE,
+            None,
+            T0 + 55_000_000_000,
+        );
+        post(
+            &mut contract,
+            sid,
+            accounts(5),
+            SCALE,
+            SCALE,
+            Some(outsider()),
+            T0 + 55_000_000_000,
+        );
+        let stale = post(
+            &mut contract,
+            sid,
+            accounts(5),
+            SCALE,
+            SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        let own = post(
+            &mut contract,
+            sid,
+            accounts(3),
+            SCALE,
+            SCALE,
+            None,
+            T0 + 55_000_000_000,
+        );
+
+        // Buyer acts after `stale` has expired but before the series does.
+        testing_env!(context(accounts(3), T0 + 40_000_000_000).build());
+        let fill = contract.fill_market_order(sid, U128(4 * SCALE), U128(50 * SCALE), None);
+        assert_eq!(fill.filled_quantity.0, SCALE);
+        assert_eq!(fill.total_premium.0, 2 * SCALE);
+        assert_eq!(fill.unfilled_quantity.0, 3 * SCALE);
+        assert!(contract.get_offer(live).is_none());
+        assert!(contract.get_offer(stale).is_some());
+        assert!(contract.get_offer(own).is_some());
+        // The book hides the expired offer but still lists the reserved one.
+        assert_eq!(
+            contract
+                .get_book(sid, 50)
+                .iter()
+                .map(|o| o.offer_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(contract.expected_custody().0, 300 * SCALE);
+    }
+
+    #[test]
+    fn market_order_rejects_when_budget_or_minimum_cannot_be_met() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        fund(&mut contract, accounts(4), 100 * SCALE);
+        post(
+            &mut contract,
+            sid,
+            accounts(4),
+            SCALE,
+            5 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+
+        testing_env!(context(accounts(3), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.fill_market_order(sid, U128(SCALE), U128(2 * SCALE), None)
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.fill_market_order(sid, U128(2 * SCALE), U128(50 * SCALE), Some(U128(2 * SCALE)))
+        }))
+        .is_err());
+        // A rejected order must leave no trace of partial state.
+        assert_eq!(contract.get_balance(accounts(3)).0, 100 * SCALE);
+        assert_eq!(contract.stats().open_ticket_count, 0);
+        assert_eq!(contract.stats().open_offer_count, 1);
+    }
+
+    #[test]
+    fn market_order_requires_funds_and_an_open_series() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        fund(&mut contract, accounts(4), 100 * SCALE);
+        post(
+            &mut contract,
+            sid,
+            accounts(4),
+            SCALE,
+            2 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+
+        testing_env!(context(accounts(3), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.fill_market_order(sid, U128(SCALE), U128(10 * SCALE), None)
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.fill_market_order(sid + 7, U128(SCALE), U128(10 * SCALE), None)
+        }))
+        .is_err());
+        // Filling past expiry is refused even though offers are still live.
+        testing_env!(context(accounts(3), T0 + 61_000_000_000).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.fill_market_order(sid, U128(SCALE), U128(10 * SCALE), None)
+        }))
+        .is_err());
+        assert_eq!(contract.stats().open_ticket_count, 0);
+        assert_eq!(contract.expected_custody().0, 100 * SCALE);
+    }
+
+    #[test]
+    fn expired_offers_cannot_brick_a_series_book() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        fund(&mut contract, accounts(4), 100_000 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+
+        // Fill the per-series cap with quotes that expire almost immediately.
+        let mut ids = Vec::new();
+        for _ in 0..MAX_OFFERS_PER_SERIES {
+            ids.push(post(
+                &mut contract,
+                sid,
+                accounts(4),
+                1,
+                1,
+                None,
+                T0 + 1_000_000_000,
+            ));
+        }
+        let balance_at_cap = contract.get_balance(accounts(4)).0;
+        let collateral_at_cap = contract.stats().total_offer_collateral.0;
+        testing_env!(context(accounts(3), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.post_offer(sid, U128(1), U128(1), None, T0 + 1_000_000_000)
+        }))
+        .is_err());
+        // Rejection at the cap must not move collateral or balances.
+        assert_eq!(contract.get_balance(accounts(4)).0, balance_at_cap);
+        assert_eq!(
+            contract.stats().total_offer_collateral.0,
+            collateral_at_cap
+        );
+
+        testing_env!(context(accounts(3), T0 + 2_000_000_000).build());
+        assert!(contract.get_book(sid, 50).is_empty());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                contract.fill_market_order(sid, U128(4), U128(10), None)
+            }))
+            .is_err(),
+            "an all-expired book must reject a sweep"
+        );
+        // Prune is bounded and repeatable.
+        assert_eq!(contract.prune_offers(sid, Some(50)), 50);
+        assert_eq!(contract.prune_offers(sid, Some(50)), 50);
+        assert_eq!(contract.prune_offers(sid, Some(50)), 50);
+        assert_eq!(contract.prune_offers(sid, Some(50)), 50);
+        assert_eq!(contract.prune_offers(sid, Some(50)), 0);
+        assert_eq!(
+            contract.stats().total_offer_collateral.0,
+            collateral_at_cap,
+            "pruning the index must not release collateral"
+        );
+        assert_eq!(contract.get_balance(accounts(4)).0, balance_at_cap);
+
+        // Capacity is back, and the maker can still recover each reservation.
+        testing_env!(context(accounts(3), T0 + 2_000_000_000).build());
+        let fresh = contract.post_offer(sid, U128(SCALE), U128(SCALE), None, T0 + 30_000_000_000);
+        assert_eq!(contract.get_book(sid, 50).len(), 1);
+        testing_env!(context(accounts(4), T0 + 2_000_000_000).build());
+        contract.cancel_offer(ids[0]);
+        assert!(contract.get_offer(ids[0]).is_none());
+        assert_eq!(
+            contract.get_balance(accounts(4)).0,
+            balance_at_cap + collateral_for(&contract, 1),
+            "a pruned offer stays cancellable"
+        );
+        testing_env!(context(accounts(3), T0 + 2_000_000_000).build());
+        contract.cancel_offer(fresh);
+        assert_eq!(contract.expected_custody().0, 100_100 * SCALE);
+    }
+
+    fn collateral_for(contract: &Contract, quantity: u128) -> u128 {
+        let series = contract.get_series(0).unwrap();
+        accounting::max_payout(
+            quantity,
+            series.high_strike - series.low_strike,
+            series.price_scale,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn book_view_and_sweep_use_the_same_order() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        for id in [3usize, 4, 5] {
+            fund(&mut contract, accounts(id), 100 * SCALE);
+        }
+        post(
+            &mut contract, sid, accounts(4), 2 * SCALE, 7 * SCALE, None, T0 + 30_000_000_000,
+        );
+        post(
+            &mut contract,
+            sid,
+            accounts(5),
+            SCALE,
+            4 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        testing_env!(context(accounts(3), T0).build());
+        let book = contract.get_book(sid, 50);
+        let order = book
+            .iter()
+            .map(|offer| offer.offer_id)
+            .collect::<Vec<_>>();
+        let dearest_unit = book.last().expect("book has levels").unit_premium.0;
+        let fill = contract.fill_market_order(sid, U128(3 * SCALE), U128(30 * SCALE), None);
+        assert_eq!(order, vec![0, 1], "ascending unit premium");
+        assert_eq!(fill.filled_quantity.0, 3 * SCALE);
+        assert_eq!(fill.total_premium.0, 11 * SCALE);
+        assert_eq!(
+            fill.worst_unit_premium.0, dearest_unit,
+            "the report must name the dearest level the book advertised"
+        );
+    }
+
+    #[test]
+    fn book_view_is_sorted_and_bounded() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        fund(&mut contract, accounts(4), 100 * SCALE);
+        fund(&mut contract, accounts(5), 100 * SCALE);
+        fund(&mut contract, outsider(), 100 * SCALE);
+        post(
+            &mut contract,
+            sid,
+            accounts(4),
+            2 * SCALE,
+            6 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        post(
+            &mut contract,
+            sid,
+            accounts(5),
+            SCALE,
+            2 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        post(
+            &mut contract,
+            sid,
+            outsider(),
+            SCALE,
+            3 * SCALE,
+            Some(accounts(3)),
+            T0 + 30_000_000_000,
+        );
+
+        testing_env!(context(accounts(3), T0).build());
+        // Unit premiums are 3, 2 and 3: cheapest first, ties by offer id.
+        let book = contract.get_book(sid, 2);
+        assert_eq!(
+            book.iter().map(|o| o.offer_id).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        let full = contract.get_book(sid, 50);
+        assert_eq!(full.len(), 3);
+        assert_eq!(full[2].offer_id, 2);
+        assert_eq!(full[2].taker, Some(accounts(3)));
+        assert!(contract.get_book(99, 50).is_empty());
+    }
+
+    #[test]
+    fn call_spreads_pay_on_the_upside_and_conserve_value() {
+        let mut contract = setup();
+        let sid = call_series(&mut contract);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        fund(&mut contract, accounts(4), 100 * SCALE);
+        let offer = post(
+            &mut contract,
+            sid,
+            accounts(4),
+            SCALE,
+            3 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        testing_env!(context(accounts(3), T0).build());
+        let ticket = contract.fill_offer(offer);
+
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        let (buyer, maker) = contract.settle_ticket(ticket);
+        assert_eq!(buyer.0, 5 * SCALE, "105 in a 100/110 call spread pays 5");
+        assert_eq!(maker.0, 8 * SCALE);
+        assert_eq!(contract.expected_custody().0, 200 * SCALE);
+
+        // Above the cap, the payoff stops at the width. A fresh series, because
+        // a fixed series cannot take new offers.
+        let sid2 = call_series(&mut contract);
+        let second = post(
+            &mut contract,
+            sid2,
+            accounts(4),
+            SCALE,
+            2 * SCALE,
+            None,
+            T0 + 30_000_000_000,
+        );
+        testing_env!(context(accounts(3), T0).build());
+        let ticket2 = contract.fill_offer(second);
+        let mut fixed2 = contract.get_series(sid2).unwrap();
+        fixed2.settlement = Settlement::Fixed {
+            price: 130 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid2, fixed2);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        let (buyer2, _) = contract.settle_ticket(ticket2);
+        assert_eq!(buyer2.0, 10 * SCALE, "capped at the 10 point width");
+    }
+
+    #[test]
+    fn bids_escrow_premium_and_a_seller_can_take_them() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        fund(&mut contract, accounts(4), 100 * SCALE);
+
+        testing_env!(context(accounts(3), T0).build());
+        let bid = contract.post_bid(
+            sid,
+            U128(SCALE),
+            U128(3 * SCALE),
+            T0 + 30_000_000_000,
+        );
+        assert_eq!(contract.get_balance(accounts(3)).0, 97 * SCALE, "premium escrowed");
+        assert_eq!(contract.stats().total_bid_escrow.0, 3 * SCALE);
+        assert_eq!(contract.expected_custody().0, 200 * SCALE);
+        let bids = contract.get_bids(sid, 10);
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].bid_id, bid);
+        assert_eq!(bids[0].unit_premium.0, 3 * SCALE);
+
+        // The seller takes the bid and becomes the maker.
+        testing_env!(context(accounts(4), T0).build());
+        let ticket = contract.fill_bid(bid);
+        assert_eq!(contract.get_balance(accounts(4)).0, 90 * SCALE, "collateral reserved");
+        assert_eq!(contract.stats().total_bid_escrow.0, 0);
+        assert_eq!(contract.stats().total_ticket_premium.0, 3 * SCALE);
+        assert_eq!(contract.stats().open_bid_count, 0);
+        assert_eq!(contract.expected_custody().0, 200 * SCALE);
+        let stored = contract.get_ticket(ticket).unwrap();
+        assert_eq!(stored.buyer, accounts(3));
+        assert_eq!(stored.maker, accounts(4));
+
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        let (buyer, maker) = contract.settle_ticket(ticket);
+        assert_eq!(buyer.0, 5 * SCALE);
+        assert_eq!(maker.0, 8 * SCALE);
+        assert_eq!(contract.get_balance(accounts(3)).0, 102 * SCALE);
+        assert_eq!(contract.get_balance(accounts(4)).0, 98 * SCALE);
+        assert_eq!(contract.expected_custody().0, 200 * SCALE);
+    }
+
+    #[test]
+    fn cancelling_a_bid_returns_the_premium() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        fund(&mut contract, accounts(3), 20 * SCALE);
+        testing_env!(context(accounts(3), T0).build());
+        let bid = contract.post_bid(sid, U128(SCALE), U128(2 * SCALE), T0 + 30_000_000_000);
+        assert_eq!(contract.get_balance(accounts(3)).0, 18 * SCALE);
+        testing_env!(context(accounts(4), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.cancel_bid(bid)
+        }))
+        .is_err());
+        testing_env!(context(accounts(3), T0).build());
+        contract.cancel_bid(bid);
+        assert_eq!(contract.get_balance(accounts(3)).0, 20 * SCALE);
+        assert_eq!(contract.get_bids(sid, 10).len(), 0);
+        assert_eq!(contract.stats().open_bid_count, 0);
+        assert_eq!(contract.expected_custody().0, 20 * SCALE);
+    }
+
+    #[test]
+    fn closing_a_ticket_pays_the_seller_and_moves_the_position() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        for who in [3, 4, 5] {
+            fund(&mut contract, accounts(who), 100 * SCALE);
+        }
+
+        testing_env!(context(accounts(3), T0).build());
+        let bid = contract.post_bid(sid, U128(SCALE), U128(3 * SCALE), T0 + 30_000_000_000);
+        testing_env!(context(accounts(4), T0).build());
+        let ticket = contract.fill_bid(bid);
+        assert_eq!(contract.get_ticket(ticket).unwrap().cost, 3 * SCALE);
+
+        // A deeper bidder wants the same shape: one contract at four.
+        testing_env!(context(accounts(5), T0 + 1_000_000_000).build());
+        let _deeper = contract.post_bid(sid, U128(SCALE), U128(4 * SCALE), T0 + 40_000_000_000);
+
+        testing_env!(context(accounts(3), T0 + 2_000_000_000).build());
+        let proceeds = contract.close_ticket(ticket, Some(U128(4 * SCALE)));
+        assert_eq!(proceeds.0, 4 * SCALE);
+
+        let moved = contract.get_ticket(ticket).unwrap();
+        assert_eq!(moved.buyer, accounts(5), "the bidder holds it now");
+        assert_eq!(moved.maker, accounts(4), "the maker's obligation never moves");
+        assert_eq!(moved.cost, 4 * SCALE, "the new holder's basis is their price");
+
+        // Alice paid three and closed at four; the bidder's four left escrow.
+        assert_eq!(contract.get_balance(accounts(3)).0, 101 * SCALE);
+        assert_eq!(contract.get_balance(accounts(5)).0, 96 * SCALE);
+        assert_eq!(contract.stats().total_bid_escrow.0, 0);
+        assert_eq!(
+            contract.stats().total_ticket_premium.0,
+            3 * SCALE,
+            "the maker is still owed the original premium"
+        );
+        assert!(contract.get_bids(sid, 10).is_empty());
+        assert_eq!(contract.expected_custody().0, 300 * SCALE);
+
+        // Positions come off the holder index, on both sides.
+        let long = contract.get_positions(accounts(5), 10);
+        assert_eq!(long.len(), 1);
+        assert_eq!(long[0].side, "long");
+        assert_eq!(long[0].ticket_id, ticket);
+        assert_eq!(long[0].cost.0, 4 * SCALE);
+        let short = contract.get_positions(accounts(4), 10);
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].side, "short");
+        assert!(contract.get_positions(accounts(3), 10).is_empty(), "closed out");
+
+        // Settlement then pays whoever holds the ticket, not the original buyer.
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        let (buyer, maker) = contract.settle_ticket(ticket);
+        assert_eq!(buyer.0, 5 * SCALE);
+        assert_eq!(maker.0, 8 * SCALE);
+        assert_eq!(contract.get_balance(accounts(5)).0, 101 * SCALE);
+        assert_eq!(contract.expected_custody().0, 300 * SCALE);
+    }
+
+    #[test]
+    fn close_only_matches_a_whole_foreign_bid_above_the_floor() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        for who in [3, 4, 5] {
+            fund(&mut contract, accounts(who), 100 * SCALE);
+        }
+        testing_env!(context(accounts(3), T0).build());
+        let bid = contract.post_bid(sid, U128(SCALE), U128(3 * SCALE), T0 + 30_000_000_000);
+        testing_env!(context(accounts(4), T0).build());
+        let ticket = contract.fill_bid(bid);
+
+        testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
+        // Her own bid is not a counterparty, and half the size is not a match.
+        contract.post_bid(sid, U128(SCALE), U128(9 * SCALE), T0 + 40_000_000_000);
+        contract.post_bid(sid, U128(SCALE / 2), U128(8 * SCALE), T0 + 40_000_000_000);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.close_ticket(ticket, None)
+        }))
+        .is_err());
+        assert_eq!(contract.get_ticket(ticket).unwrap().buyer, accounts(3));
+
+        // A fair price exists but the seller's floor is higher: no fill.
+        testing_env!(context(accounts(5), T0 + 2_000_000_000).build());
+        contract.post_bid(sid, U128(SCALE), U128(4 * SCALE), T0 + 40_000_000_000);
+        testing_env!(context(accounts(3), T0 + 3_000_000_000).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.close_ticket(ticket, Some(U128(5 * SCALE)))
+        }))
+        .is_err());
+        assert_eq!(
+            contract.stats().open_bid_count,
+            3,
+            "a rejected close must not consume a bid"
+        );
+        assert_eq!(contract.expected_custody().0, 300 * SCALE);
+
+        // Closing after the series is fixed is refused.
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.close_ticket(ticket, None)
+        }))
+        .is_err());
+    }
+
+    /// One contract at `mid`, with a `budget` cap, bought by `buyer`.
+    fn buy_from(
+        contract: &mut Contract,
+        buyer: AccountId,
+        sid: u64,
+        mid: u128,
+        budget: u128,
+    ) -> u64 {
+        testing_env!(context(buyer, T0).build());
+        contract.pool_buy(sid, U128(SCALE), U128(mid), U128(budget))
+    }
+
+    #[test]
+    fn the_pool_writes_a_ticket_and_holds_only_its_own_worst_case() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        assert_eq!(contract.get_lp_shares(accounts(5)).0, 20 * SCALE);
+        assert_eq!(
+            contract.get_balance(accounts(5)).0,
+            0,
+            "vault money is not a tradable balance"
+        );
+
+        testing_env!(context(accounts(3), T0).build());
+        // One contract at a 3.00 mid, with a 4.00 budget: the entry is 3.12.
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+
+        let vault = contract.get_pool_state();
+        assert_eq!(vault.equity.0, 23 * SCALE, "the mid joins equity");
+        assert_eq!(vault.venue_locked.0, 120_000, "the margin does not");
+        assert_eq!(vault.venue.0, 0);
+        assert_eq!(vault.reserved.0, 7 * SCALE, "10 worst case less the 3 kept");
+        assert_eq!(vault.free_equity.0, 16 * SCALE);
+        assert_eq!(vault.utilisation_bps.0, 3_043);
+        assert_eq!(vault.open_tickets, 1);
+        assert_eq!(vault.margin_bps, 400);
+
+        let stored = contract.get_ticket(ticket).unwrap();
+        assert_eq!(stored.maker, vault_account(), "the vault is the maker");
+        assert_eq!(stored.collateral, 10 * SCALE);
+        assert_eq!(stored.premium, 3_120_000);
+        assert_eq!(stored.venue_cut, 120_000);
+        assert_eq!(stored.cost, stored.premium);
+
+        assert_eq!(contract.get_balance(accounts(3)).0, 96_880_000);
+        // The book buckets stay empty: a pool ticket's money lives in the vault.
+        assert_eq!(contract.stats().total_ticket_collateral.0, 0);
+        assert_eq!(contract.stats().total_ticket_premium.0, 0);
+        assert_eq!(contract.stats().open_ticket_count, 1);
+        assert_eq!(contract.expected_custody().0, 120 * SCALE);
+
+        let positions = contract.get_positions(accounts(3), 10);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].side, "long");
+        assert_eq!(positions[0].cost.0, 3_120_000, "the fee is inside the basis");
+        assert_eq!(positions[0].collateral.0, 10 * SCALE);
+        assert_eq!(
+            positions[0].maker,
+            vault_account(),
+            "a holder must be able to see they are trading against the vault"
+        );
+        assert!(
+            contract.get_positions(vault_account(), 10).is_empty(),
+            "the vault is indexed by its own balance sheet, not per ticket"
+        );
+    }
+
+    #[test]
+    fn a_pool_entry_is_bounded_by_the_payoff_the_buyers_budget_and_the_equity() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 1_000 * SCALE);
+        fund(&mut contract, accounts(3), 1_000 * SCALE);
+
+        // A 10-point spread can never pay more than 10, so it may never cost
+        // more than 10 either: an over-marked engine cannot overcharge a ticket.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buy_from(&mut contract, accounts(3), sid, 11 * SCALE, 100 * SCALE)
+        }))
+        .is_err());
+        // The buyer's own slippage budget, tighter than the quote.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buy_from(&mut contract, accounts(3), sid, 3 * SCALE, 3 * SCALE)
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buy_from(&mut contract, accounts(3), sid, 0, 10 * SCALE)
+        }))
+        .is_err());
+        // A buyer without the balance cannot open a position, and a rejection
+        // leaves the vault exactly as it was.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buy_from(&mut contract, accounts(4), sid, 3 * SCALE, 4 * SCALE)
+        }))
+        .is_err());
+        assert_eq!(contract.get_pool_state().equity.0, 1_000 * SCALE);
+        assert_eq!(contract.get_pool_state().reserved.0, 0);
+        assert_eq!(contract.stats().open_ticket_count, 0);
+        assert_eq!(contract.expected_custody().0, 2_000 * SCALE);
+
+        // Capacity: 10 of equity takes two of these and refuses the third,
+        // because the third worst case would outrun what the pool holds.
+        let mut tight = setup();
+        let tid = series(&mut tight);
+        deposit_to_pool(&mut tight, accounts(5), 10 * SCALE);
+        fund(&mut tight, accounts(3), 100 * SCALE);
+        buy_from(&mut tight, accounts(3), tid, 3 * SCALE, 10 * SCALE);
+        buy_from(&mut tight, accounts(3), tid, 3 * SCALE, 10 * SCALE);
+        assert_eq!(tight.get_pool_state().equity.0, 16 * SCALE);
+        assert_eq!(tight.get_pool_state().reserved.0, 14 * SCALE);
+        assert_eq!(tight.get_pool_state().free_equity.0, 2 * SCALE);
+        assert_eq!(tight.get_pool_state().utilisation_bps.0, 8_750);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buy_from(&mut tight, accounts(3), tid, 3 * SCALE, 10 * SCALE)
+        }))
+        .is_err());
+        assert_eq!(tight.get_pool_state().open_tickets, 2);
+        assert_eq!(tight.get_balance(accounts(3)).0, 100 * SCALE - 6_240_000);
+        assert_eq!(tight.expected_custody().0, 110 * SCALE);
+    }
+
+    #[test]
+    fn a_pool_ticket_settles_out_of_equity_and_the_margin_is_then_earned() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        testing_env!(context(accounts(3), T0).build());
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+
+        // Fixed below the low strike: the spread pays its full width.
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 95 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        let (buyer, maker) = contract.settle_ticket(ticket);
+        assert_eq!(buyer.0, 10 * SCALE);
+        assert_eq!(maker.0, 0, "the vault keeps its premium, it has no escrow");
+
+        let vault = contract.get_pool_state();
+        assert_eq!(vault.equity.0, 13 * SCALE, "20 principal plus 3 kept minus 10 paid");
+        assert_eq!(vault.reserved.0, 0);
+        assert_eq!(vault.venue_locked.0, 0);
+        assert_eq!(vault.venue.0, 120_000, "the ticket can no longer be voided");
+        assert_eq!(vault.open_tickets, 0);
+        assert_eq!(contract.get_balance(accounts(3)).0, 106_880_000);
+        assert_eq!(contract.stats().open_ticket_count, 0);
+        assert_eq!(contract.expected_custody().0, 120 * SCALE);
+
+        // The sweep moves the fee from the vault's bucket to the venue's
+        // balance. The LP's share price is untouched by it.
+        let shares = contract.get_lp_shares(accounts(5)).0;
+        assert_eq!(sweep(&mut contract), 120_000);
+        assert_eq!(contract.get_balance(accounts(0)).0, 120_000);
+        assert_eq!(contract.get_pool_state().equity.0, 13 * SCALE);
+        assert_eq!(contract.get_pool_state().venue.0, 0);
+        assert_eq!(contract.expected_custody().0, 120 * SCALE);
+        // And the LP still owns the whole equity at par.
+        testing_env!(context(accounts(5), T0).build());
+        // The number the screen quotes before the click is the number the exit
+        // pays — same floor, same operands, read-only.
+        assert_eq!(contract.get_lp_value(accounts(5)).0, 13 * SCALE);
+        assert_eq!(contract.get_lp_value(accounts(3)).0, 0, "an account with no shares has no exit value");
+        assert_eq!(contract.pool_withdraw(U128(shares)).0, 13 * SCALE);
+        assert_eq!(contract.expected_custody().0, 120 * SCALE);
+    }
+
+    #[test]
+    fn the_vault_can_be_entered_with_money_already_at_the_venue() {
+        let mut contract = setup();
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        let custody = contract.expected_custody().0;
+        assert_eq!(custody, 100 * SCALE);
+
+        testing_env!(context(accounts(3), T0).build());
+        assert_eq!(contract.pool_deposit_from_balance(U128(20 * SCALE)).0, 20 * SCALE);
+        assert_eq!(contract.get_balance(accounts(3)).0, 80 * SCALE);
+        assert_eq!(contract.get_pool_state().equity.0, 20 * SCALE);
+        assert_eq!(contract.get_lp_shares(accounts(3)).0, 20 * SCALE);
+        // Cash moved buckets, it did not move the venue: the sum is what the
+        // token balance has to match, and entering the vault cannot break that.
+        assert_eq!(contract.expected_custody().0, custody);
+
+        // A second LP buys into the NAV, not at par: the first 20 are already
+        // in, so the next 20 tokens are worth the same 20 shares only while
+        // equity and shares are still 1:1.
+        fund(&mut contract, accounts(4), 30 * SCALE);
+        testing_env!(context(accounts(4), T0).build());
+        assert_eq!(contract.pool_deposit_from_balance(U128(30 * SCALE)).0, 30 * SCALE);
+        assert_eq!(contract.get_pool_state().shares.0, 50 * SCALE);
+        assert_eq!(contract.get_lp_value(accounts(4)).0, 30 * SCALE);
+
+        // Redeeming pays back into the same tradable balance it came from.
+        assert_eq!(contract.pool_withdraw(U128(30 * SCALE)).0, 30 * SCALE);
+        assert_eq!(contract.get_balance(accounts(4)).0, 30 * SCALE);
+        // 130 entered the venue from two accounts and none of it left: the
+        // vault moved money between buckets, never off the balance sheet.
+        assert_eq!(contract.expected_custody().0, 130 * SCALE);
+
+        // An account with nothing at the venue mints nothing.
+        testing_env!(context(accounts(5), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.pool_deposit_from_balance(U128(SCALE))
+        }))
+        .is_err());
+        assert_eq!(contract.get_pool_state().equity.0, 20 * SCALE);
+        assert_eq!(contract.get_lp_shares(accounts(5)).0, 0);
+    }
+
+    #[test]
+    fn only_the_named_venue_can_sweep_and_sweeping_pays_nothing_while_open() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        testing_env!(context(accounts(3), T0).build());
+        contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+
+        // A stranger cannot take the fee.
+        testing_env!(context(accounts(4), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.pool_sweep()
+        }))
+        .is_err());
+        // The venue can ask, but an open ticket still owns that margin: a void
+        // would have nothing to refund from.
+        assert_eq!(sweep(&mut contract), 0);
+        assert_eq!(contract.get_pool_state().venue_locked.0, 120_000);
+        assert_eq!(contract.get_balance(accounts(0)).0, 0);
+
+        // Hand the position back early and the same slice becomes takeable.
+        testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
+        let exit = contract.pool_close(
+            contract.get_positions(accounts(3), 10)[0].ticket_id,
+            U128(2 * SCALE),
+        );
+        assert_eq!(exit.0, 1_800_000, "2.00 mid less the 10% haircut");
+        assert_eq!(contract.get_pool_state().venue.0, 120_000);
+        assert_eq!(sweep(&mut contract), 120_000);
+    }
+
+    #[test]
+    fn closing_a_pool_ticket_early_destroys_it_and_returns_the_reservation() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        testing_env!(context(accounts(3), T0).build());
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+
+        testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
+        let exit = contract.pool_close(ticket, U128(2 * SCALE));
+        assert_eq!(exit.0, 1_800_000);
+        assert!(contract.get_ticket(ticket).is_none(), "the position is gone");
+        assert!(contract.get_positions(accounts(3), 10).is_empty());
+        assert_eq!(contract.get_pool_state().reserved.0, 0);
+        assert_eq!(contract.get_pool_state().equity.0, 21_200_000);
+        assert_eq!(contract.stats().open_ticket_count, 0);
+        assert_eq!(contract.get_pool_state().open_tickets, 0);
+        assert_eq!(contract.get_balance(accounts(3)).0, 98_680_000);
+        assert_eq!(contract.expected_custody().0, 120 * SCALE);
+
+        // Selling back at the same mid the entry used still costs the round
+        // trip: the margin in, the haircut out.
+        testing_env!(context(accounts(3), T0 + 2_000_000_000).build());
+        let again = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        testing_env!(context(accounts(3), T0 + 3_000_000_000).build());
+        let back = contract.pool_close(again, U128(3 * SCALE));
+        assert!(back.0 < 3_120_000, "a round trip cannot be free");
+        assert_eq!(contract.expected_custody().0, 120 * SCALE);
+    }
+
+    #[test]
+    fn a_void_refunds_the_full_premium_and_leaves_the_pool_as_it_started() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        testing_env!(context(accounts(3), T0).build());
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+
+        testing_env!(context(outsider(), T0 + 700_000_000_000).build());
+        contract.void_series(sid);
+        let (buyer, maker) = contract.settle_ticket(ticket);
+        assert_eq!(buyer.0, 3_120_000, "everything the buyer paid comes back");
+        assert_eq!(maker.0, 0);
+        assert_eq!(contract.get_balance(accounts(3)).0, 100 * SCALE);
+
+        let vault = contract.get_pool_state();
+        assert_eq!((vault.equity.0, vault.reserved.0), (20 * SCALE, 0));
+        assert_eq!((vault.venue.0, vault.venue_locked.0), (0, 0), "no fee on a void");
+        assert_eq!(vault.open_tickets, 0);
+        assert_eq!(contract.expected_custody().0, 120 * SCALE);
+        // The LP can still take everything out, which only works because the
+        // refund was sourced from the two buckets that collected it.
+        testing_env!(context(accounts(5), T0).build());
+        let shares = contract.get_lp_shares(accounts(5)).0;
+        assert_eq!(contract.pool_withdraw(U128(shares)).0, 20 * SCALE);
+    }
+
+    #[test]
+    fn an_lp_cannot_leave_in_front_of_the_worst_case_the_pool_is_holding() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 10 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        let shares = contract.get_lp_shares(accounts(5)).0;
+        let mut ticket = Vec::new();
+        for _ in 0..2 {
+            testing_env!(context(accounts(3), T0).build());
+            ticket.push(contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE)));
+        }
+        assert_eq!(contract.get_pool_state().free_equity.0, 2 * SCALE);
+
+        testing_env!(context(accounts(5), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.pool_withdraw(U128(shares))
+        }))
+        .is_err());
+        // Even the 2 of slack is not enough to cover a 14 reservation.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.pool_withdraw(U128(2 * SCALE))
+        }))
+        .is_err());
+        assert_eq!(contract.get_lp_shares(accounts(5)).0, shares);
+
+        // Both run off worthless, and the LP's exit is open again: the premium
+        // they kept is exactly what the buyers lost.
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 120 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        for id in ticket.clone() {
+            let (buyer, _) = contract.settle_ticket(id);
+            assert_eq!(buyer.0, 0);
+        }
+        assert_eq!(contract.get_pool_state().reserved.0, 0);
+        testing_env!(context(accounts(5), T0).build());
+        assert_eq!(contract.pool_withdraw(U128(shares)).0, 16 * SCALE);
+        assert_eq!(sweep(&mut contract), 240_000);
+        assert_eq!(contract.expected_custody().0, 110 * SCALE);
+    }
+
+    #[test]
+    fn a_pool_obligation_follows_the_ticket_not_the_person_who_bought_it() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        for who in [3, 4] {
+            fund(&mut contract, accounts(who), 100 * SCALE);
+        }
+        testing_env!(context(accounts(3), T0).build());
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+
+        // Someone else bids for the whole position, and the holder sells into
+        // the book rather than back to the vault.
+        testing_env!(context(accounts(4), T0 + 1_000_000_000).build());
+        let _bid = contract.post_bid(sid, U128(SCALE), U128(3 * SCALE), T0 + 40_000_000_000);
+        testing_env!(context(accounts(3), T0 + 2_000_000_000).build());
+        let proceeds = contract.close_ticket(ticket, None);
+        assert_eq!(proceeds.0, 3 * SCALE);
+
+        let moved = contract.get_ticket(ticket).unwrap();
+        assert_eq!(moved.buyer, accounts(4));
+        assert_eq!(moved.maker, vault_account(), "the vault still owes the payoff");
+        assert_eq!(moved.premium, 3_120_000, "the entry the vault made is unchanged");
+        assert_eq!(moved.venue_cut, 120_000);
+        assert_eq!(moved.cost, 3 * SCALE, "the new holder's basis is their price");
+        assert_eq!(contract.get_pool_state().reserved.0, 7 * SCALE);
+        assert_eq!(contract.expected_custody().0, 220 * SCALE);
+
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        testing_env!(context(outsider(), T0 + 120_000_000_000).build());
+        let (buyer, maker) = contract.settle_ticket(ticket);
+        assert_eq!(buyer.0, 5 * SCALE, "paid to whoever holds it");
+        assert_eq!(maker.0, 0);
+        assert_eq!(contract.get_balance(accounts(4)).0, 102 * SCALE);
+        assert_eq!(contract.get_balance(accounts(3)).0, 99_880_000);
+        let vault = contract.get_pool_state();
+        assert_eq!(vault.equity.0, 18 * SCALE);
+        assert_eq!((vault.reserved.0, vault.venue_locked.0), (0, 0));
+        assert_eq!(contract.expected_custody().0, 220 * SCALE);
+    }
+
+    #[test]
+    fn fee_terms_move_the_entry_price_but_never_the_worst_case() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 100 * SCALE);
+        fund(&mut contract, accounts(3), 1_000 * SCALE);
+
+        testing_env!(context(accounts(0), T0).build());
+        contract.set_fee_terms(800, 2_000);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.set_fee_terms(10_000, 0)
+        }))
+        .is_err());
+        // A stranger cannot set them.
+        testing_env!(context(accounts(4), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.set_fee_terms(0, 0)
+        }))
+        .is_err());
+
+        testing_env!(context(accounts(3), T0).build());
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(10 * SCALE));
+        assert_eq!(contract.get_pool_state().margin_bps, 800);
+        // 3.00 mid plus 8% = 3.24, of which 0.24 is the venue's.
+        let stored = contract.get_ticket(ticket).unwrap();
+        assert_eq!(stored.premium, 3_240_000);
+        assert_eq!(stored.venue_cut, 240_000);
+        assert_eq!(stored.collateral, 10 * SCALE, "the risk is the same trade");
+        assert_eq!(contract.get_pool_state().equity.0, 103 * SCALE);
+        assert_eq!(contract.get_pool_state().reserved.0, 7 * SCALE);
+
+        // Exiting at the same mid now gives back 80% of the mid.
+        testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
+        let exit = contract.pool_close(ticket, U128(3 * SCALE));
+        assert_eq!(exit.0, 2_400_000);
+        assert_eq!(contract.expected_custody().0, 1_100 * SCALE);
+        assert_eq!(sweep(&mut contract), 240_000);
+    }
+
+    #[test]
+    fn the_vault_rejects_a_deposit_it_cannot_price() {
+        let mut contract = setup();
+        // Zero never mints, and an unknown message is returned to the sender
+        // rather than absorbed into the pool.
+        testing_env!(context(accounts(1), T0).build());
+        assert_eq!(
+            contract.ft_on_transfer(accounts(3), U128(0), "pool-deposit".to_string()),
+            "0"
+        );
+        assert_eq!(
+            contract.ft_on_transfer(accounts(3), U128(SCALE), "poolles".to_string()),
+            "1000000"
+        );
+        assert_eq!(contract.get_lp_shares(accounts(3)).0, 0);
+        assert_eq!(contract.get_pool_state().equity.0, 0);
+        assert_eq!(contract.get_pool_state().utilisation_bps.0, 0);
+        assert_eq!(contract.expected_custody().0, 0);
+
+        // An empty pool cannot write, however cheap the mark looks.
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        let sid = series(&mut contract);
+        testing_env!(context(accounts(3), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.pool_buy(sid, U128(SCALE), U128(SCALE), U128(10 * SCALE))
+        }))
+        .is_err());
+        // And a share redemption for someone who holds nothing is refused.
+        testing_env!(context(accounts(4), T0).build());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.pool_withdraw(U128(SCALE))
+        }))
+        .is_err());
+    }
+}
