@@ -139,13 +139,18 @@ fn side(
     // out a price: the loaded premium on a deep in-the-money rung passes its own
     // width, and a ticket bought there loses money at every print.
     let openable = q.mid_units > 0 && q.entry_units > 0 && q.entry_units < q.max_payout_units;
+    // Opening and closing are not the same question. A spread whose loaded entry
+    // costs more than it can ever pay is not for sale, but a ticket already held
+    // still has an exit value, and hiding it would strand the holder with a
+    // position the screen says cannot be sold.
+    let exitable = q.mid_units > 0 && q.exit_units > 0;
     let money = |units: u128| json!(points(units));
-    let text = |units: u128| if openable { json!(units.to_string()) } else { Value::Null };
+    let shown = |units: u128, allowed: bool| if allowed { json!(units.to_string()) } else { Value::Null };
     Some(json!({
         "mark": q.mark,
         // The pool's own two-sided price: entry is loaded, exit is haircut.
         "ask": if openable { money(q.entry_units) } else { Value::Null },
-        "bid": if openable { money(q.exit_units) } else { Value::Null },
+        "bid": if exitable { money(q.exit_units) } else { Value::Null },
         "markIv": q.mark_iv,
         "bidIv": q.bid_iv,
         "askIv": q.ask_iv,
@@ -154,9 +159,9 @@ fn side(
         "vega": q.vega,
         "theta": q.theta,
         "midUnits": if openable { q.mid_units.to_string() } else { "0".to_string() },
-        "entryUnits": text(q.entry_units),
-        "exitUnits": text(q.exit_units),
-        "venueCutUnits": text(q.venue_cut_units),
+        "entryUnits": shown(q.entry_units, openable),
+        "exitUnits": shown(q.exit_units, exitable),
+        "venueCutUnits": shown(q.venue_cut_units, openable),
         "maxPayoutUnits": q.max_payout_units.to_string(),
         "openable": openable,
         "low": spec.low_units.to_string(),
@@ -636,6 +641,11 @@ mod tests {
         assert_eq!(cell["openable"], json!(false), "{:?}", cell["openable"]);
         assert!(cell["ask"].is_null(), "no ask is offered for a certain loss");
         assert_eq!(cell["midUnits"], json!("0"), "and the entry arithmetic is withheld with it");
+        assert!(
+            cell["exitUnits"].as_str().is_some(),
+            "a ticket already held still has an exit value: the close is not gated on the open"
+        );
+        assert!(cell["bid"].is_number(), "and the screen can show it");
         assert!(cell["mark"].as_f64().unwrap() > 99.0, "the mark itself stays honest");
     }
 
