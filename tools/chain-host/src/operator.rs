@@ -214,31 +214,56 @@ pub fn parse_print(body: &str) -> Result<Print, String> {
     Ok(Print { price_units, publish_time_ns, confidence_bps })
 }
 
-/// A series whose expiry has passed and whose accept window has not.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Due {
-    pub series_id: u64,
-    pub feed: String,
-    pub expiry_ns: u64,
-    pub accept_until_ns: u64,
-}
-
-/// ETH-USD → ETH: which engine index can fix a series on this feed.
-pub fn feed_asset(feed: &str) -> Option<&str> {
-    feed.split('-').next().filter(|asset| !asset.is_empty())
-}
-
-impl Due {
-    pub fn asset(&self) -> Option<&str> {
-        feed_asset(&self.feed)
-    }
-}
-
 /// Which of the chain's series need a print *now*. Anything already Fixed,
 /// Pending or Void is not due, and anything past its accept window is no longer
 /// fixable — that one is a void for the holder, and reporting into it would only
 /// fail on chain.
-pub fn due_for_fix(rows: &[(u64, Value)], now_ns: u64) -> Vec<Due> {
+/// How long the contract lets a venue quote stay payable, for a series on this
+/// ladder. It mirrors the contract's own two tiers: a market inside a day is
+/// quoted as if it were live, and a week-out market can be renewed less often
+/// because its price barely moves in a minute. An operator renewing on a different
+/// clock than the one that ages quotes out is a vault that stops trading on
+/// schedule, and says so with "the venue has not quoted this series".
+pub const QUOTE_AGE_NEAR_NS: u64 = 60_000_000_000;
+pub const QUOTE_AGE_FAR_NS: u64 = 300_000_000_000;
+const DAY_NS: u64 = 24 * 3_600_000_000_000;
+
+pub fn quote_age(expiry_ns: u64, now_ns: u64) -> u64 {
+    if expiry_ns.saturating_sub(now_ns) <= DAY_NS {
+        QUOTE_AGE_NEAR_NS
+    } else {
+        QUOTE_AGE_FAR_NS
+    }
+}
+
+/// Which ladders a pass should quote, soonest-overdue first and capped, so a pass
+/// stays finite while no ladder is left past half its quote life. Renewing at half
+/// the age limit is the slack that keeps a slow pass — or a transaction still in
+/// flight — from landing a quote past its own expiry.
+pub fn ladders_due(
+    expiries: &[u64],
+    now_ns: u64,
+    last_quoted: &std::collections::HashMap<u64, u64>,
+    limit: usize,
+) -> Vec<u64> {
+    let mut scored: Vec<(u64, u64)> = Vec::new();
+    for expiry_ns in expiries {
+        let renew_ns = quote_age(*expiry_ns, now_ns) / 2;
+        let overdue = match last_quoted.get(expiry_ns) {
+            None => u64::MAX,
+            Some(&at) => now_ns.saturating_sub(at).saturating_sub(renew_ns),
+        };
+        if overdue > 0 {
+            scored.push((overdue, *expiry_ns));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().take(limit).map(|(_, expiry)| expiry).collect()
+}
+
+/// A series whose expiry has passed and whose accept window has not: the ones a
+/// print can still turn into a payout this pass.
+pub fn due_for_fix(rows: &[(u64, Value)], now_ns: u64) -> Vec<u64> {
     let mut due = Vec::new();
     for (series_id, row) in rows {
         if row.get("settlement").and_then(Value::as_str) != Some("Open") {
@@ -253,35 +278,9 @@ pub fn due_for_fix(rows: &[(u64, Value)], now_ns: u64) -> Vec<Due> {
         if expiry_ns > now_ns || now_ns > accept_until_ns {
             continue;
         }
-        due.push(Due {
-            series_id: *series_id,
-            feed: row
-                .get("oracle_feed")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            expiry_ns,
-            accept_until_ns,
-        });
+        due.push(*series_id);
     }
     due
-}
-
-/// The feeds that need a print, once each, as `(feed, asset)` in the order first
-/// seen. One report per feed per pass covers every series on it, and the oracle
-/// rejects a second observation that does not advance time — which a per-series
-/// pass would trip, since a rung's put and call expire on the same clock. A feed
-/// the engine cannot name is dropped: there is no index to ask for it.
-pub fn feeds_needing_prints(due: &[Due]) -> Vec<(String, String)> {
-    let mut seen: Vec<(String, String)> = Vec::new();
-    for item in due {
-        let Some(asset) = item.asset() else { continue };
-        let pair = (item.feed.clone(), asset.to_string());
-        if !pair.0.is_empty() && !seen.iter().any(|seen| seen.0 == pair.0) {
-            seen.push(pair);
-        }
-    }
-    seen
 }
 
 /// One side of one ladder row, as the engine marked it. `mid_units` is the
@@ -652,6 +651,46 @@ mod tests {
     }
 
     #[test]
+    fn a_near_ladder_is_renewed_more_often_than_a_far_one() {
+        let hour = 3_600_000_000_000u64;
+        let near = 1_000 + hour;
+        let far = 1_000 + 7 * 24 * hour;
+        let mut last = std::collections::HashMap::new();
+        last.insert(near, 1_000u64);
+        last.insert(far, 1_000u64);
+        // Forty seconds after both were quoted: the near one is past half its
+        // sixty-second life, the far one has minutes to spare.
+        assert_eq!(
+            ladders_due(&[near, far], 1_000 + 40 * 1_000_000_000, &last, 4),
+            vec![near],
+            "the ladder a trader can click today is the one that gets the next pass"
+        );
+        assert_eq!(quote_age(near, 1_000), QUOTE_AGE_NEAR_NS);
+        assert_eq!(quote_age(far, 1_000), QUOTE_AGE_FAR_NS);
+    }
+
+    #[test]
+    fn a_ladder_never_quoted_is_due_and_the_most_overdue_goes_first() {
+        let hour = 3_600_000_000_000u64;
+        let a = 1_000 + hour;
+        let b = 1_000 + 2 * hour;
+        let c = 1_000 + 3 * hour;
+        let mut last = std::collections::HashMap::new();
+        last.insert(a, 1_000u64);
+        last.insert(b, 1_000 + 50 * 1_000_000_000);
+        let now = 1_000 + 70 * 1_000_000_000;
+        assert_eq!(
+            ladders_due(&[b, a, c], now, &last, 4),
+            vec![c, a],
+            "the unquoted ladder first, then the one whose quote is oldest"
+        );
+        assert_eq!(ladders_due(&[b, a, c], now, &last, 1).len(), 1, "and a pass stays bounded");
+        let fresh: std::collections::HashMap<u64, u64> =
+            [(a, now), (b, now), (c, now)].into_iter().collect();
+        assert!(ladders_due(&[a, b, c], now, &fresh, 4).is_empty(), "nothing renewed this pass");
+    }
+
+    #[test]
     fn a_series_is_due_only_inside_its_own_window() {
         let rows = vec![
             row(7, json!("Open"), 1_000, 2_000, "ETH-USD"),
@@ -662,14 +701,10 @@ mod tests {
             row(12, json!("Void"), 1_000, 2_000, "ETH-USD"),
         ];
         let due = due_for_fix(&rows, 1_800);
-        assert_eq!(
-            due.iter().map(|d| d.series_id).collect::<Vec<_>>(),
-            vec![7],
-            "past expiry, inside the window, still Open: {due:?}"
-        );
+        assert_eq!(due, vec![7], "past expiry, inside the window, still Open");
         assert!(due_for_fix(&rows, 900).is_empty(), "nothing is due before its expiry");
         assert!(
-            due_for_fix(&rows, 2_500).iter().all(|d| d.series_id != 7),
+            !due_for_fix(&rows, 2_500).contains(&7),
             "and the window closes: a late print is a void, not a fix"
         );
     }
@@ -682,29 +717,6 @@ mod tests {
             (3, Value::Null),
         ];
         assert!(due_for_fix(&rows, 10_000).is_empty(), "no expiry is not an expired series");
-    }
-
-    #[test]
-    fn one_print_per_feed_no_matter_how_many_series_expire_together() {
-        // The whole grid expires on the same clock, so a pass that reported per
-        // series would trip the oracle's advance-time rule on the second one.
-        let due = vec![
-            Due { series_id: 1, feed: "ETH-USD".into(), expiry_ns: 1, accept_until_ns: 9 },
-            Due { series_id: 2, feed: "ETH-USD".into(), expiry_ns: 1, accept_until_ns: 9 },
-            Due { series_id: 3, feed: "BTC-USD".into(), expiry_ns: 1, accept_until_ns: 9 },
-            Due { series_id: 4, feed: String::new(), expiry_ns: 1, accept_until_ns: 9 },
-        ];
-        assert_eq!(
-            feeds_needing_prints(&due),
-            vec![
-                ("ETH-USD".to_string(), "ETH".to_string()),
-                ("BTC-USD".to_string(), "BTC".to_string()),
-            ],
-            "the feedless series is dropped, not asked of an asset named \"\""
-        );
-        assert_eq!(due[0].asset(), Some("ETH"));
-        assert_eq!(due[3].asset(), None, "a series with no feed cannot be fixed");
-        assert_eq!(feed_asset("-USD"), None, "an empty asset is not a name");
     }
 
     #[test]

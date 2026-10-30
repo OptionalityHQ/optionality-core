@@ -17,6 +17,7 @@
 // so Ctrl-C takes the chain down with it, and re-lists on `--list-secs`.
 use anyhow::{Context, Result};
 mod operator;
+mod oracle;
 
 use near_workspaces::types::{Gas, NearToken};
 use near_workspaces::{Account, Contract};
@@ -32,6 +33,10 @@ const EACH: u128 = 5_000_000;
 /// README far enough to fund it.
 const LP_SEED: u128 = 100_000;
 const GAS: Gas = Gas::from_tgas(80);
+/// How often the committee is asked for prices, on its own task. Fast enough
+/// that a seat is never stale when a series comes due, slow enough that nobody
+/// outside this machine is being polled to death.
+const ORACLE_SECS: u64 = 8;
 const ROLES: [&str; 10] = [
     "you", "lp", "maker-1", "maker-2", "maker-3", "bidder-1", "bidder-2", "taker-1", "taker-2",
     "taker-3",
@@ -68,14 +73,20 @@ fn assets() -> Vec<String> {
 /// reads is cheaper than an index the contract would have to maintain.
 async fn chain_series(options: &Contract) -> Result<Vec<(u64, serde_json::Value)>> {
     let stats = options.view("stats").await?.json()?;
-    let mut rows = Vec::new();
-    for id in 0..operator::series_count(&stats).unwrap_or(0) {
-        let view = options
-            .view("get_series")
-            .args_json(json!({ "series_id": id }))
+    let count = operator::series_count(&stats).unwrap_or(0);
+    let mut rows = Vec::with_capacity(count as usize);
+    // The registry in the batches the contract allows. Every round trip here is a
+    // pass that is not quoting a ladder, and a ladder nobody quoted is one the
+    // trader cannot buy from — a week of markets turned this into hundreds of
+    // reads a pass until it did.
+    for start in (0..count).step_by(128) {
+        let ids: Vec<u64> = (start..(start + 128).min(count)).collect();
+        let batch: Vec<(u64, Option<serde_json::Value>)> = options
+            .view("get_series_many")
+            .args_json(json!({ "series_ids": ids }))
             .await?
             .json()?;
-        rows.push((id, view));
+        rows.extend(batch.into_iter().map(|(id, row)| (id, row.unwrap_or(serde_json::Value::Null))));
     }
     Ok(rows)
 }
@@ -193,78 +204,100 @@ async fn list_ladder(
     Ok((created, planned))
 }
 
-/// Report the index for every feed that has a series past expiry, then ask the
-/// contract to fix them. Without this leg a ticket can be bought and closed but
-/// never paid out: the contract will only settle on an observation the oracle
-/// holds, and the oracle only accepts one from this account.
+/// Put every seat's price on chain.
 ///
-/// One print per feed per pass, because the oracle rejects an observation that
-/// does not advance time and the whole grid expires on the same clock.
-async fn fix_due(
+/// The host asks each source its own question — the venue's index, Kraken's book,
+/// OKX's book, CoinGecko's aggregate — signs each answer with that seat's key, and
+/// delivers the batch. Delivering is the host's entire contribution: a price it
+/// made up cannot become a fix because it cannot sign for a seat, and a price one
+/// real seat made up cannot become a fix either, because a fix needs a quorum.
+///
+/// Seats are asked on their own cadences. CoinGecko's free page is rate limited
+/// and an aggregate that moves once a minute does not want polling every five
+/// seconds; the venue's index is asked every pass because it is the only answer
+/// carrying an exchange's own timestamp.
+///
+/// Returns how many prices the oracle accepted. It is the caller's job to keep the
+/// venue's index from re-stamping the same print, since the oracle refuses an
+/// observation that does not advance time.
+async fn feed_committee(
     admin: &Account,
-    options: &Contract,
     oracle: &Contract,
+    seats: &[oracle::Seat],
     engine: &str,
-    rows: &[(u64, serde_json::Value)],
-    now_ns: u64,
     last_print_ns: &mut std::collections::HashMap<String, u64>,
-) -> Result<(usize, usize)> {
-    let due = operator::due_for_fix(rows, now_ns);
-    if due.is_empty() {
-        return Ok((0, 0));
-    }
-    let engine = engine.trim_end_matches('/');
-    let mut reported = 0usize;
-    for (feed, asset) in operator::feeds_needing_prints(&due) {
-        // One unusable print is not a reason to drop the whole pass: the other
-        // feed may be perfectly quotable, and the series that cannot be fixed
-        // here are voided once their window closes.
-        let body = match operator::http_get(&format!("{engine}/index?asset={asset}")) {
-            Ok(body) => body,
-            Err(error) => {
-                println!("no print for {feed}: {error}");
-                continue;
-            }
-        };
-        let print = match operator::parse_print(&body) {
-            Ok(print) => print,
-            Err(error) => {
-                println!("no print for {feed}: {error}");
-                continue;
-            }
-        };
-        if last_print_ns.get(&feed).is_some_and(|last| print.publish_time_ns <= *last) {
-            // The clock has not moved since the last report on this feed. Waiting
-            // one more pass is right; panicking on the oracle would not be.
+    waited: &mut [u64],
+    tick_secs: u64,
+) -> Result<usize> {
+    let mut batch = Vec::new();
+    for (index, seat) in seats.iter().enumerate() {
+        waited[index] += tick_secs;
+        if waited[index] < oracle::every_secs(seat.name) {
             continue;
         }
-        admin
-            .call(oracle.id(), "report")
-            .args_json(json!({
-                "feed_id": feed,
-                "price": print.price_units,
-                "publish_time_ns": print.publish_time_ns,
-                "confidence_bps": print.confidence_bps as u16,
-            }))
-            .gas(GAS)
-            .transact()
-            .await?
-            .into_result()?;
-        last_print_ns.insert(feed, print.publish_time_ns);
-        reported += 1;
+        waited[index] = 0;
+        for feed in &oracle::FEEDS {
+            let tick = match oracle::fetch(seat.name, feed, engine) {
+                Ok(tick) => tick,
+                // One silent source costs the committee a vote, not a settlement:
+                // a quorum of the others still fixes.
+                Err(error) => {
+                    println!("{} says nothing about {}: {error}", seat.name, feed.id);
+                    continue;
+                }
+            };
+            if seat.name == "venue-index"
+                && last_print_ns
+                    .get(feed.id)
+                    .is_some_and(|last| tick.publish_time_ns <= *last)
+            {
+                // The index has not moved. Waiting one more pass is right; making
+                // the oracle refuse a replay is noise.
+                continue;
+            }
+            last_print_ns.insert(feed.id.to_string(), tick.publish_time_ns);
+            batch.push(seat.observation(feed.id, &tick));
+        }
     }
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let outcome = admin
+        .call(oracle.id(), "submit_observations")
+        .args_json(json!({ "observations": batch }))
+        .gas(GAS)
+        .transact()
+        .await?
+        .into_result()?
+        .json::<serde_json::Value>()?;
+    let accepted = outcome["accepted"].as_u64().unwrap_or(0) as usize;
+    for rejected in outcome["rejected"].as_array().map(|v| v.clone()).unwrap_or_default() {
+        println!("oracle refused a price: {}", rejected.as_str().unwrap_or("?"));
+    }
+    Ok(accepted)
+}
+
+/// Ask the contract to fix every series whose expiry has passed and whose
+/// acceptance window has not. The committee has to be talking already — a fix is
+/// made of prices the oracle holds, not of prices requested here.
+async fn request_fixes(
+    admin: &Account,
+    options: &Contract,
+    rows: &[(u64, serde_json::Value)],
+    now_ns: u64,
+) -> Result<usize> {
     let mut asked = 0usize;
-    for item in &due {
+    for series_id in operator::due_for_fix(rows, now_ns) {
         admin
             .call(options.id(), "request_settlement")
-            .args_json(json!({ "series_id": item.series_id }))
+            .args_json(json!({ "series_id": series_id }))
             .gas(GAS)
             .transact()
             .await?
             .into_result()?;
         asked += 1;
     }
-    Ok((reported, asked))
+    Ok(asked)
 }
 
 /// Name the vault's prices. The contract will only trade a series at a mid the
@@ -406,11 +439,32 @@ async fn main() -> Result<()> {
         .into_result()?;
     oracle
         .call("new")
-        .args_json(json!({ "owner": admin.id(), "reporter": admin.id() }))
+        .args_json(json!({ "owner": admin.id() }))
         .gas(GAS)
         .transact()
         .await?
         .into_result()?;
+    // Seat the committee before anything can trade. The host holds these keys for
+    // as long as the sandbox lives and never writes them down; the oracle only
+    // accepts a price signed by the seat it belongs to.
+    let seats = oracle::committee();
+    for seat in &seats {
+        admin
+            .call(oracle.id(), "add_source")
+            .args_json(&seat.registration())
+            .gas(GAS)
+            .transact()
+            .await?
+            .into_result()?;
+    }
+    admin
+        .call(oracle.id(), "set_quorum")
+        .args_json(json!({ "quorum": 2 }))
+        .gas(GAS)
+        .transact()
+        .await?
+        .into_result()?;
+    println!("seated {} sources, quorum 2", seats.len());
     options
         .call("new")
         .args_json(json!({ "admin": admin.id(), "token": token.id(), "oracle": oracle.id() }))
@@ -459,15 +513,6 @@ async fn main() -> Result<()> {
 
     let engine = optional("--engine");
     let list_secs: u64 = arg("--list-secs", "300").parse().context("--list-secs must be seconds")?;
-    // Well inside the contract's own quote age limit, which is what makes a
-    // stopped host a vault that stops trading rather than one stuck on
-    // yesterday's price. Ten seconds against a sixty-second limit leaves six
-    // passes of slack, and it keeps the price the trader clicks close to the
-    // price the contract charges.
-    // The longest a pass may take. With several ladders it is the *cycle* that
-    // has to stay under the contract's sixty-second quote age, so the effective
-    // step is the smaller of this and the schedule divided by that budget.
-    let quote_secs: u64 = arg("--quote-secs", "10").parse().context("--quote-secs must be seconds")?;
     let assets_list = assets();
     let mut listed = (0usize, 0usize);
     if let Some(url) = &engine {
@@ -502,7 +547,18 @@ async fn main() -> Result<()> {
         // quotes a week of ladders is a boot nobody waits for.
         for expiry_ns in expiries.iter().copied().take(1) {
             match read_standing(&options, &rows, expiry_ns).await {
-                Ok(live) => match quote_ladder(&admin, &options, url, &assets_list, &rows, expiry_ns, &live, now_ns, quote_secs * 1_000_000_000).await {
+                Ok(live) => match quote_ladder(
+                    &admin,
+                    &options,
+                    url,
+                    &assets_list,
+                    &rows,
+                    expiry_ns,
+                    &live,
+                    now_ns,
+                    operator::quote_age(expiry_ns, now_ns) / 2,
+                )
+                .await {
                     Ok((posted, priced)) => println!("quoted {posted} of {priced} priced cells at {}", stamp(expiry_ns)),
                     Err(error) => println!("quoting failed, chain still live: {error}"),
                 },
@@ -543,6 +599,45 @@ async fn main() -> Result<()> {
             .json()?
     };
 
+    // Feed the committee before the screen opens. The first paint should show a
+    // table with prices in it rather than four empty seats, and a settlement that
+    // comes due minutes from now should not depend on this loop ever having run.
+    if let Some(url) = &engine {
+        let mut printed = std::collections::HashMap::new();
+        let mut ready = vec![1_000u64; seats.len()];
+        match feed_committee(&admin, &oracle, &seats, url, &mut printed, &mut ready, 1).await {
+            Ok(accepted) => println!("committee opened with {accepted} signed prices"),
+            Err(error) => println!("committee feed failed to start, chain still live: {error}"),
+        }
+        // The feed runs beside the operator loop rather than inside it. A pass
+        // reads every series back from the chain and takes half a minute when the
+        // venue is full; a seat that only speaks once per pass would then be
+        // stale by the contract's own clock at the moment a ticket needs it.
+        let (admin, oracle, seats, engine_url) =
+            (admin.clone(), oracle.clone(), seats.clone(), url.clone());
+        tokio::spawn(async move {
+            let mut printed = std::collections::HashMap::new();
+            let mut waited = vec![0u64; seats.len()];
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(ORACLE_SECS)).await;
+                match feed_committee(
+                    &admin,
+                    &oracle,
+                    &seats,
+                    &engine_url,
+                    &mut printed,
+                    &mut waited,
+                    ORACLE_SECS,
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(error) => println!("committee feed failed, chain still live: {error}"),
+                }
+            }
+        });
+    }
+
     let session = json!({
         "schema": "bounded-options/chain-session/1",
         "at": now.to_string(),
@@ -579,14 +674,11 @@ async fn main() -> Result<()> {
     if let Some(url) = &engine {
         let tick_secs: u64 = arg("--tick-secs", "5").parse().context("--tick-secs must be seconds")?;
         let assets_list = assets();
-        let mut last_print: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let mut since_list = list_secs;
-        let mut since_quote = quote_secs;
-        let mut cursor = 0usize;
+        let mut last_quoted: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(tick_secs)).await;
             since_list += tick_secs;
-            since_quote += tick_secs;
             let rows = match chain_series(&options).await {
                 Ok(rows) => rows,
                 Err(error) => {
@@ -610,15 +702,15 @@ async fn main() -> Result<()> {
                 }
             }
             let now_ns = worker.view_block().await?.timestamp();
-            // One ladder per pass, round-robin. The cycle has to stay inside the
-            // contract's sixty-second quote age or the far expiries stop trading
-            // between visits, so the step shrinks as the schedule grows.
-            let step = quote_secs.min((40 / expiries.len().max(1) as u64).max(2));
-            if since_quote >= step && !expiries.is_empty() {
-                since_quote = 0;
-                let expiry_ns = expiries[cursor % expiries.len()];
-                cursor = (cursor + 1) % expiries.len();
-                let renew_ns = step * 1_000_000_000;
+            // Quote the ladders whose own renewal deadlines have passed instead of
+            // walking a fixed rotation. A pass takes as long as reading the
+            // registry back, and a rotation that reached a ladder every few minutes
+            // left the near ones — the ones a trader can actually click — past the
+            // contract's quote age between visits, which the screen then reports as
+            // a vault that will not sell.
+            for expiry_ns in operator::ladders_due(&expiries, now_ns, &last_quoted, 4) {
+                let renew_ns = operator::quote_age(expiry_ns, now_ns) / 2;
+                last_quoted.insert(expiry_ns, now_ns);
                 match read_standing(&options, &rows, expiry_ns).await {
                     Ok(live) => match quote_ladder(
                         &admin, &options, url, &assets_list, &rows, expiry_ns, &live, now_ns, renew_ns,
@@ -636,8 +728,8 @@ async fn main() -> Result<()> {
                     Err(error) => println!("quote read failed, chain still live: {error}"),
                 }
             }
-            match fix_due(&admin, &options, &oracle, url, &rows, now_ns, &mut last_print).await {
-                Ok((reported, asked)) if asked > 0 => println!("fixed {asked} series on {reported} feed prints"),
+            match request_fixes(&admin, &options, &rows, now_ns).await {
+                Ok(asked) if asked > 0 => println!("asked the oracle to fix {asked} expired series"),
                 Ok(_) => {}
                 Err(error) => println!("fixing failed, chain still live: {error}"),
             }

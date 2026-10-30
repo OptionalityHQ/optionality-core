@@ -15,4 +15,5 @@
 pub mod accounting;
 pub mod consolation;
 pub mod fees;
+pub mod oracle;
 pub mod pool;

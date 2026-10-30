@@ -12,11 +12,41 @@ const TOKEN_WASM: &[u8] = include_bytes!("../../target/near/mock_ft/mock_ft.wasm
 const ORACLE_WASM: &[u8] =
     include_bytes!("../../target/near/price_oracle/price_oracle.wasm");
 
+/// A seat at the committee and the key that speaks for it. The tests keep two:
+/// a quorum of two is the smallest rule where one honest price is not yet a
+/// settlement, which is the whole point of the oracle.
+struct Seat {
+    name: &'static str,
+    key: ed25519_dalek::SigningKey,
+}
+
+/// The same four names the operator seats, minus the ones no test needs. Our own
+/// index is at the table so a test can ask the exact question that matters: what
+/// happens when only it speaks, and what happens when only the others do.
+fn seats() -> Vec<Seat> {
+    ["venue-index", "kraken", "okx"]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| Seat {
+            name,
+            key: ed25519_dalek::SigningKey::from_bytes(&[index as u8 + 3; 32]),
+        })
+        .collect()
+}
+
+fn seat_of<'a>(seats: &'a [Seat], name: &str) -> &'a Seat {
+    seats
+        .iter()
+        .find(|seat| seat.name == name)
+        .expect("the test committee seats this source")
+}
+
 struct Env {
     worker: Worker<near_workspaces::network::Sandbox>,
     options: Contract,
     token: Contract,
     oracle: Contract,
+    seats: Vec<Seat>,
     admin: Account,
     alice: Account,
     bob: Account,
@@ -72,12 +102,25 @@ async fn setup() -> Result<Env> {
         .transact()
         .await?
         .into_result()?;
+    let seats = seats();
     oracle
         .call("new")
-        .args_json(json!({ "owner": admin.id(), "reporter": admin.id() }))
+        .args_json(json!({ "owner": admin.id() }))
         .transact()
         .await?
         .into_result()?;
+    for seat in &seats {
+        admin
+            .call(oracle.id(), "add_source")
+            .args_json(json!({
+                "name": seat.name,
+                "public_key": seat.key.verifying_key().to_bytes().to_vec(),
+            }))
+            .gas(Gas::from_tgas(50))
+            .transact()
+            .await?
+            .into_result()?;
+    }
     options
         .call("new")
         .args_json(json!({
@@ -116,6 +159,7 @@ async fn setup() -> Result<Env> {
         options,
         token,
         oracle,
+        seats,
         admin,
         alice,
         bob,
@@ -163,6 +207,75 @@ impl Env {
             .await?
             .json()?;
         Ok((expected.parse()?, token.parse()?))
+    }
+
+    /// Put prices on the oracle the way real sources do: one signature per seat,
+    /// and nothing a relay can forge. A single price is a candidate; a quorum of
+    /// them agreeing inside the tolerance is what becomes a fix.
+    async fn report(&self, feed: &str, spokes: &[(&str, u128)]) -> Result<Value> {
+        let now = self.worker.view_block().await?.timestamp();
+        let stamp = now.saturating_sub(1_000_000_000);
+        let observations: Vec<Value> = spokes
+            .iter()
+            .enumerate()
+            .map(|(index, (name, price))| {
+                let seat = seat_of(&self.seats, name);
+                // One nanosecond apart so each seat's own history still advances.
+                let publish_time_ns = stamp + index as u64;
+                let message = bounded_core::oracle::signing_message(
+                    feed,
+                    seat.name,
+                    *price,
+                    publish_time_ns,
+                    9_000,
+                );
+                let signature = ed25519_dalek::Signer::sign(&seat.key, &message).to_bytes();
+                json!({
+                    "feed_id": feed,
+                    "source": seat.name,
+                    "price": price,
+                    "publish_time_ns": publish_time_ns,
+                    "confidence_bps": 9_000,
+                    "signature": signature.to_vec(),
+                })
+            })
+            .collect();
+        self.admin
+            .call(self.oracle.id(), "submit_observations")
+            .args_json(json!({ "observations": observations }))
+            .gas(Gas::from_tgas(150))
+            .transact()
+            .await?
+            .into_result()?
+            .json::<Value>()
+            .map_err(Into::into)
+    }
+
+    /// The committee in agreement, and specifically *not* including our own seat:
+    /// two independent sources signing the same number is the price every
+    /// settlement test below is paid on.
+    async fn fix(&self, feed: &str, price: u128) -> Result<()> {
+        let outcome = self
+            .report(feed, &[("kraken", price), ("okx", price)])
+            .await?;
+        if outcome["fixed"].as_array().map(|rows| rows.is_empty()) != Some(false) {
+            return Err(anyhow!("the committee did not fix {feed}: {outcome}"));
+        }
+        Ok(())
+    }
+
+    /// Ask the contract what a series settled at, and wait for the oracle's
+    /// answer to come back as a callback.
+    async fn settle(&self, series_id: u64) -> Result<Value> {
+        self.admin
+            .call(self.options.id(), "request_settlement")
+            .args_json(json!({ "series_id": series_id }))
+            .gas(Gas::from_tgas(100))
+            .transact()
+            .await?
+            .into_result()?;
+        self.worker.fast_forward(5).await?;
+        self.series(series_id).await
     }
 
     async fn series(&self, id: u64) -> Result<Value> {
@@ -228,6 +341,17 @@ impl Env {
 }
 
 async fn create_series(env: &Env, expiry_offset_ns: u64, finalize_offset_ns: u64) -> Result<u64> {
+    create_series_with_floor(env, expiry_offset_ns, finalize_offset_ns, 5_000).await
+}
+
+/// `min_confidence_bps` is the series' own demand of the oracle: how sure the
+/// committee has to be before this particular ticket pays out.
+async fn create_series_with_floor(
+    env: &Env,
+    expiry_offset_ns: u64,
+    finalize_offset_ns: u64,
+    min_confidence_bps: u16,
+) -> Result<u64> {
     let now = env.worker.view_block().await?.timestamp();
     let expiry = now + expiry_offset_ns;
     let id: u64 = env
@@ -242,7 +366,7 @@ async fn create_series(env: &Env, expiry_offset_ns: u64, finalize_offset_ns: u64
             "low_strike": (100u128 * SCALE).to_string(),
             "high_strike": (110u128 * SCALE).to_string(),
             "price_scale": SCALE.to_string(),
-            "min_confidence_bps": 5000,
+            "min_confidence_bps": min_confidence_bps,
             "oracle_feed": "ETH-USD"
         }))
         .transact()
@@ -319,18 +443,7 @@ async fn full_lifecycle_settles_and_pays_out() -> Result<()> {
 
     env.advance_past(env.worker.view_block().await?.timestamp() + 15_000_000_000)
         .await?;
-    let now = env.worker.view_block().await?.timestamp();
-    env.admin
-        .call(env.oracle.id(), "report")
-        .args_json(json!({
-            "feed_id": "ETH-USD",
-            "price": 105u128 * SCALE,
-            "publish_time_ns": now,
-            "confidence_bps": 9000
-        }))
-        .transact()
-        .await?
-        .into_result()?;
+    env.fix("ETH-USD", 105u128 * SCALE).await?;
 
     env.admin
         .call(env.options.id(), "request_settlement")
@@ -343,6 +456,13 @@ async fn full_lifecycle_settles_and_pays_out() -> Result<()> {
 
     let series = env.series(series_id).await?;
     assert_eq!(series["settlement"]["Fixed"]["price"].as_u64(), Some(105_000_000));
+    // The venue's own index never spoke in this test, and the ticket still paid
+    // out on schedule: the engine quotes the market and is not what settles it.
+    assert_eq!(
+        series["settle_sources"].as_array().map(|rows| rows.len()),
+        Some(2),
+        "two third-party seats priced this settlement"
+    );
 
     env.admin
         .call(env.options.id(), "settle_ticket")
@@ -546,18 +666,7 @@ async fn market_order_sweeps_the_book_and_settles_every_ticket() -> Result<()> {
 
     env.advance_past(env.worker.view_block().await?.timestamp() + 40_000_000_000)
         .await?;
-    let now = env.worker.view_block().await?.timestamp();
-    env.admin
-        .call(env.oracle.id(), "report")
-        .args_json(json!({
-            "feed_id": "ETH-USD",
-            "price": 105u128 * SCALE,
-            "publish_time_ns": now,
-            "confidence_bps": 9000
-        }))
-        .transact()
-        .await?
-        .into_result()?;
+    env.fix("ETH-USD", 105u128 * SCALE).await?;
     env.admin
         .call(env.options.id(), "request_settlement")
         .args_json(json!({ "series_id": series_id }))
@@ -756,86 +865,116 @@ async fn prune_offers_frees_the_book_without_releasing_collateral() -> Result<()
 }
 
 #[tokio::test]
-async fn low_confidence_observation_cannot_settle() -> Result<()> {
+async fn one_source_alone_cannot_settle_a_ticket() -> Result<()> {
+    // The property the committee exists for. Every other settlement test below has
+    // two signatures behind its price; this one hands the chain a single honest
+    // price — which is exactly what the venue used to settle on — and gets refused.
     let env = setup().await?;
     let series_id = create_series(&env, 8_000_000_000, 120_000_000_000).await?;
     post_and_fill(&env, series_id).await?;
-
     env.advance_past(env.worker.view_block().await?.timestamp() + 15_000_000_000)
         .await?;
-    let now = env.worker.view_block().await?.timestamp();
-    env.admin
-        .call(env.oracle.id(), "report")
-        .args_json(json!({
-            "feed_id": "ETH-USD",
-            "price": 105u128 * SCALE,
-            "publish_time_ns": now,
-            "confidence_bps": 100
-        }))
-        .transact()
-        .await?
-        .into_result()?;
 
-    env.admin
-        .call(env.options.id(), "request_settlement")
-        .args_json(json!({ "series_id": series_id }))
-        .gas(Gas::from_tgas(100))
-        .transact()
+    env.report("ETH-USD", &[("venue-index", 105u128 * SCALE)]).await?;
+    let committee: Value = env
+        .oracle
+        .view("get_committee")
+        .args_json(json!({ "feed_id": "ETH-USD" }))
         .await?
-        .into_result()?;
-    env.worker.fast_forward(5).await?;
-    let series = env.series(series_id).await?;
-    assert_eq!(series["settlement"], json!("Open"));
+        .json()?;
+    assert_eq!(committee["fresh_sources"].as_u64(), Some(1));
+    assert_eq!(committee["can_fix"], json!(false), "one seat is not a quorum");
 
-    env.worker.fast_forward(3).await?;
-    let skewed = env.worker.view_block().await?.timestamp();
-    env.admin
-        .call(env.oracle.id(), "report")
-        .args_json(json!({
-            "feed_id": "ETH-USD",
-            "price": 105u128 * 100 * SCALE,
-            "publish_time_ns": skewed,
-            "confidence_bps": 9000
-        }))
-        .transact()
-        .await?
-        .into_result()?;
-    env.admin
-        .call(env.options.id(), "request_settlement")
-        .args_json(json!({ "series_id": series_id }))
-        .gas(Gas::from_tgas(100))
-        .transact()
-        .await?
-        .into_result()?;
-    env.worker.fast_forward(5).await?;
-    let series = env.series(series_id).await?;
+    let series = env.settle(series_id).await?;
     assert_eq!(
         series["settlement"], json!("Open"),
-        "100x scale mismatch must not settle"
+        "the venue's own print, alone, cannot pay a holder out"
     );
 
+    // Two other seats name a number, and the same series settles — while our own
+    // seat, still fresh and still outvoted, is not in the price that pays. The
+    // committee makes a settlement, not the messenger.
     env.worker.fast_forward(3).await?;
-    let later = env.worker.view_block().await?.timestamp();
-    env.admin
-        .call(env.oracle.id(), "report")
-        .args_json(json!({
-            "feed_id": "ETH-USD",
-            "price": 105u128 * SCALE,
-            "publish_time_ns": later,
-            "confidence_bps": 9000
-        }))
-        .transact()
+    env.report("ETH-USD", &[("kraken", 108u128 * SCALE), ("okx", 108u128 * SCALE)]).await?;
+    let series = env.settle(series_id).await?;
+    assert_eq!(
+        series["settlement"]["Fixed"]["price"].as_u64(),
+        Some(108_000_000),
+        "the two third-party seats priced it, not the one that was alone earlier"
+    );
+    let sources: Vec<String> = series["settle_sources"]
+        .as_array()
+        .expect("a fix names its sources")
+        .iter()
+        .map(|source| source.as_str().expect("a source name").to_string())
+        .collect();
+    assert_eq!(sources, vec!["kraken".to_string(), "okx".to_string()]);
+    assert_eq!(
+        series["settle_dispersion_bps"].as_u64(),
+        Some(0),
+        "two seats that said the same thing are a certain price"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_committee_that_barely_agrees_cannot_meet_a_confident_series() -> Result<()> {
+    // A series may demand more certainty than the oracle's tolerance merely
+    // offers. The fix is real — two honest signatures ten basis points apart — and
+    // the venue still will not pay on it.
+    let env = setup().await?;
+    let series_id = create_series_with_floor(&env, 8_000_000_000, 120_000_000_000, 9_999).await?;
+    post_and_fill(&env, series_id).await?;
+    env.advance_past(env.worker.view_block().await?.timestamp() + 15_000_000_000)
+        .await?;
+
+    let outcome = env
+        .report(
+            "ETH-USD",
+            &[("kraken", 105u128 * SCALE), ("okx", 105u128 * SCALE + 100_000)],
+        )
+        .await?;
+    assert_eq!(outcome["fixed"].as_array().map(|rows| rows.len()), Some(1));
+    let fix: Value = env
+        .oracle
+        .view("get_latest_fix")
+        .args_json(json!({ "feed_id": "ETH-USD" }))
         .await?
-        .into_result()?;
-    env.admin
-        .call(env.options.id(), "request_settlement")
-        .args_json(json!({ "series_id": series_id }))
-        .gas(Gas::from_tgas(100))
-        .transact()
-        .await?
-        .into_result()?;
-    env.worker.fast_forward(5).await?;
-    let series = env.series(series_id).await?;
+        .json()?;
+    assert!(fix["dispersion_bps"].as_u64().unwrap_or(0) >= 5);
+    assert!(fix["confidence_bps"].as_u64() < Some(9_999));
+
+    let series = env.settle(series_id).await?;
+    assert_eq!(
+        series["settlement"], json!("Open"),
+        "the series asked for near-certainty and the committee gave it ten basis points of doubt"
+    );
+
+    // Where every seat signs the identical number, the same series does settle.
+    env.worker.fast_forward(3).await?;
+    env.fix("ETH-USD", 104u128 * SCALE).await?;
+    let series = env.settle(series_id).await?;
+    assert_eq!(series["settlement"]["Fixed"]["price"].as_u64(), Some(104_000_000));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fix_outside_the_series_band_is_still_not_a_price() -> Result<()> {
+    let env = setup().await?;
+    let series_id = create_series(&env, 8_000_000_000, 120_000_000_000).await?;
+    post_and_fill(&env, series_id).await?;
+    env.advance_past(env.worker.view_block().await?.timestamp() + 15_000_000_000)
+        .await?;
+
+    // Both seats agree, perfectly — on a number a hundred times too large. The
+    // quorum is a rule about who spoke, not about whether the price is sane.
+    env.fix("ETH-USD", 105u128 * 100 * SCALE).await?;
+    let series = env.settle(series_id).await?;
+    assert_eq!(series["settlement"], json!("Open"), "a 100x scale mismatch must not settle");
+
+    env.worker.fast_forward(3).await?;
+    env.fix("ETH-USD", 105u128 * SCALE).await?;
+    let series = env.settle(series_id).await?;
     assert_eq!(series["settlement"]["Fixed"]["price"].as_u64(), Some(105_000_000));
     Ok(())
 }
@@ -899,18 +1038,7 @@ async fn a_seller_can_take_a_resting_bid() -> Result<()> {
 
     // Settle at 105: the bidder buys the 5-point payoff at a 3 premium.
     env.advance_past(now + 40_000_000_000).await?;
-    let published = env.worker.view_block().await?.timestamp();
-    env.admin
-        .call(env.oracle.id(), "report")
-        .args_json(json!({
-            "feed_id": "ETH-USD",
-            "price": 105u128 * SCALE,
-            "publish_time_ns": published,
-            "confidence_bps": 9000
-        }))
-        .transact()
-        .await?
-        .into_result()?;
+    env.fix("ETH-USD", 105u128 * SCALE).await?;
     env.admin
         .call(env.options.id(), "request_settlement")
         .args_json(json!({ "series_id": series_id }))

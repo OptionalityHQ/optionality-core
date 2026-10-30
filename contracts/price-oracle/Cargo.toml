@@ -9,3 +9,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 near-sdk = "5.30.0"
+bounded-core = { path = "../../core" }
+
+[dev-dependencies]
+near-sdk = { version = "5.30.0", features = ["unit-testing"] }
+ed25519-dalek = "2.2.0"

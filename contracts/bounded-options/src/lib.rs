@@ -29,6 +29,11 @@ const MAX_ACCEPT_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 const MAX_FINALIZE_WINDOW_NS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 const SETTLEMENT_GRACE_NS: u64 = 300 * 1_000_000_000;
 const PRICE_BOUND_FACTOR: u128 = 10;
+/// The venue will not pay out on one party's word. Whatever oracle is wired in,
+/// a settlement price has to arrive naming at least this many independent sources
+/// — so a single-reporter oracle, or a compromised one, cannot settle a ticket
+/// even if it is the only price the venue is told about.
+const MIN_SOURCES_FOR_FIX: usize = 2;
 /// How long a venue quote stays payable. The vault only trades at a price the
 /// venue itself published, and a published price is only worth what it said
 /// while it is still current.
@@ -43,6 +48,10 @@ const MAX_QUOTE_SLACK_NS: u64 = 5 * 1_000_000_000;
 /// One batched quote write covers a whole ladder and no more, the same ceiling
 /// `get_pool_prices` puts on a read.
 const MAX_QUOTES_PER_CALL: usize = 64;
+/// How many series one read may ask for. The registry is derived — this contract
+/// is the only record of which strikes exist — so every reader walks the id range,
+/// and one view per series made a week of ladders into hundreds of round trips.
+const MAX_SERIES_PER_CALL: usize = 128;
 
 #[derive(BorshStorageKey, BorshSerialize)]
 #[borsh(crate = "near_sdk::borsh")]
@@ -87,6 +96,12 @@ pub struct Series {
     pub oracle_feed: String,
     pub settlement: Settlement,
     pub pending_since_ns: u64,
+    /// Who signed the price this series fixed on. Empty until it fixes, and kept
+    /// afterwards: a ticket that paid out should always be able to say which
+    /// sources priced it, years later, from the chain alone.
+    pub settle_sources: Vec<String>,
+    /// How far those sources were apart, in basis points.
+    pub settle_dispersion_bps: u32,
 }
 
 /// The payoff family of a series. Puts protect a fall, calls protect a rise;
@@ -175,6 +190,9 @@ pub struct PositionView {
     pub expiry_ns: u64,
     pub settlement: String,
     pub fixed_price: Option<U128>,
+    /// Who signed the price a finished ticket paid out on. Empty while the
+    /// series is still open.
+    pub settle_sources: Vec<String>,
 }
 
 #[near(serializers = [json])]
@@ -283,12 +301,19 @@ pub struct MarketFill {
     pub worst_unit_premium: U128,
 }
 
+/// What the oracle hands back for a settlement window. `sources` names who
+/// signed the number: a fix with fewer than two of them is one party's word, and
+/// the venue refuses it whatever the oracle that said it is.
 #[near(serializers = [json])]
 #[derive(Clone)]
 pub struct PriceObservation {
     pub price: u128,
     pub publish_time_ns: u64,
     pub confidence_bps: u16,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub dispersion_bps: u32,
 }
 
 #[near(serializers = [json])]
@@ -335,6 +360,28 @@ fn emit(event: &str, data: near_sdk::serde_json::Value) {
             "data": data
         })
     ));
+}
+
+/// Whether the venue may pay out on a number the oracle returned.
+///
+/// Five separate reasons to refuse it, none of which is the oracle's own
+/// business: a price outside the band this series could conceivably settle at is
+/// a wrong feed, a stamp outside the series' own window is the wrong moment, a
+/// thin confidence is a committee that does not know, and fewer than two named
+/// sources is one party's word however well it is signed. Every rule is checked
+/// here rather than trusted from the oracle, because the oracle is a separate
+/// contract someone could swap for a friendlier one.
+fn usable_fix(obs: &PriceObservation, series: &Series, now: u64) -> bool {
+    let upper_bound = series.high_strike.saturating_mul(PRICE_BOUND_FACTOR);
+    let lower_bound = series.low_strike / PRICE_BOUND_FACTOR;
+    obs.price > 0
+        && obs.price >= lower_bound
+        && obs.price <= upper_bound
+        && obs.publish_time_ns <= now
+        && obs.publish_time_ns >= series.expiry_ns
+        && obs.publish_time_ns <= series.accept_until_ns
+        && obs.confidence_bps >= series.min_confidence_bps
+        && obs.sources.len() >= MIN_SOURCES_FOR_FIX
 }
 
 #[near(contract_state)]
@@ -660,6 +707,8 @@ impl Contract {
                 oracle_feed,
                 settlement: Settlement::Open,
                 pending_since_ns: 0,
+                settle_sources: Vec::new(),
+                settle_dispersion_bps: 0,
             },
         );
         emit(
@@ -1424,23 +1473,14 @@ impl Contract {
             });
 
         let now = env::block_timestamp();
-        let upper_bound = series.high_strike.saturating_mul(PRICE_BOUND_FACTOR);
-        let lower_bound = series.low_strike / PRICE_BOUND_FACTOR;
-        let chosen = observations.unwrap_or_default().into_iter().find(|obs| {
-            obs.price > 0
-                && obs.price >= lower_bound
-                && obs.price <= upper_bound
-                && obs.publish_time_ns <= now
-                && obs.publish_time_ns >= series.expiry_ns
-                && obs.publish_time_ns <= series.accept_until_ns
-                && obs.confidence_bps >= series.min_confidence_bps
-        });
+        let chosen = observations.unwrap_or_default().into_iter().find(|obs| usable_fix(obs, &series, now));
 
         series.settlement = match chosen {
-            Some(obs) => Settlement::Fixed {
-                price: obs.price,
-                publish_time_ns: obs.publish_time_ns,
-            },
+            Some(obs) => {
+                series.settle_dispersion_bps = obs.dispersion_bps;
+                series.settle_sources = obs.sources;
+                Settlement::Fixed { price: obs.price, publish_time_ns: obs.publish_time_ns }
+            }
             None => Settlement::Open,
         };
         series.pending_since_ns = 0;
@@ -1449,7 +1489,9 @@ impl Contract {
             "settlement_resolved",
             near_sdk::serde_json::json!({
                 "series_id": series_id,
-                "settlement": series.settlement
+                "settlement": series.settlement,
+                "sources": series.settle_sources,
+                "dispersion_bps": series.settle_dispersion_bps,
             }),
         );
         true
@@ -1681,6 +1723,7 @@ impl Contract {
                         Settlement::Fixed { price, .. } => Some(U128(price)),
                         _ => None,
                     },
+                    settle_sources: series.settle_sources.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -1773,6 +1816,16 @@ impl Contract {
 
     pub fn get_series(&self, series_id: u64) -> Option<Series> {
         self.series.get(&series_id).cloned()
+    }
+
+    /// Several series in one round trip, with the id beside each answer so a
+    /// missing series is a hole the reader can see rather than a shifted row.
+    pub fn get_series_many(&self, series_ids: Vec<u64>) -> Vec<(u64, Option<Series>)> {
+        require!(series_ids.len() <= MAX_SERIES_PER_CALL, "too many series at once");
+        series_ids
+            .into_iter()
+            .map(|series_id| (series_id, self.series.get(&series_id).cloned()))
+            .collect()
     }
 
     pub fn get_offer(&self, offer_id: u64) -> Option<Offer> {
@@ -3949,5 +4002,74 @@ mod tests {
         };
         contract.series.insert(sid, fixed);
         assert!(contract.get_pool_prices(vec![sid], U128(SCALE)).is_empty());
+    }
+
+    fn fix(price: u128, stamp: u64, confidence: u16, sources: &[&str]) -> PriceObservation {
+        PriceObservation {
+            price,
+            publish_time_ns: stamp,
+            confidence_bps: confidence,
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            dispersion_bps: 10,
+        }
+    }
+
+    /// The series helper makes: expiry T0+60s, accepted until T0+120s, strikes
+    /// 100..110, confidence floor 5000 bps.
+    fn settled_series(contract: &mut Contract) -> Series {
+        let sid = series(contract);
+        contract.get_series(sid).expect("the helper listed a series")
+    }
+
+    #[test]
+    fn the_whole_registry_comes_back_in_a_few_reads() {
+        let mut contract = setup();
+        let ids = (0..3u64).map(|_| series(&mut contract)).collect::<Vec<_>>();
+        testing_env!(context(accounts(0), T0).build());
+        let mut asked = ids.clone();
+        asked.push(ids[0] + 999);
+        let rows = contract.get_series_many(asked);
+        assert_eq!(rows.len(), 4, "an id the chain does not have is still answered");
+        assert_eq!(rows[3].1, None, "and answered as a hole, not as a shifted row");
+        assert_eq!(rows[0].0, ids[0], "each answer carries the id it is for");
+        assert_eq!(rows[0].1.as_ref().expect("listed").underlying, "ETH");
+    }
+
+    #[test]
+    #[should_panic(expected = "too many series at once")]
+    fn one_read_cannot_ask_for_the_world() {
+        let contract = setup();
+        contract.get_series_many((0..129u64).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn one_source_is_not_a_settlement_price() {
+        let mut contract = setup();
+        let row = settled_series(&mut contract);
+        let alone = fix(105 * SCALE, T0 + 61_000_000_000, 10_000, &["engine"]);
+        assert!(
+            !usable_fix(&alone, &row, T0 + 62_000_000_000),
+            "the party that quoted the ticket cannot also be the only one to settle it"
+        );
+        let quorum = fix(105 * SCALE, T0 + 61_000_000_000, 9_990, &["engine", "kraken"]);
+        assert!(usable_fix(&quorum, &row, T0 + 62_000_000_000));
+    }
+
+    #[test]
+    fn a_fix_must_stay_inside_its_own_window_and_band() {
+        let mut contract = setup();
+        let row = settled_series(&mut contract);
+        let good = |stamp: u64, price: u128| {
+            usable_fix(&fix(price, stamp, 9_990, &["a", "b"]), &row, T0 + 62_000_000_000)
+        };
+        assert!(good(T0 + 61_000_000_000, 105 * SCALE));
+        assert!(!good(T0 + 59_000_000_000, 105 * SCALE), "a stamp before the expiry is the wrong moment");
+        assert!(!good(T0 + 121_000_000_000, 105 * SCALE), "and one after the acceptance window is too late");
+        assert!(!good(T0 + 61_000_000_000, 9 * SCALE), "a price under the band is a wrong feed");
+        assert!(!good(T0 + 61_000_000_000, 1_200 * SCALE), "and so is one over it");
+        assert!(
+            !usable_fix(&fix(105 * SCALE, T0 + 61_000_000_000, 4_999, &["a", "b"]), &row, T0 + 62_000_000_000),
+            "a committee that cannot agree to within the series' floor is not a price"
+        );
     }
 }
