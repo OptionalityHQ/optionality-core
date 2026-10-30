@@ -229,6 +229,63 @@ pub fn plan_json(asset: Asset, spot: f64, expiry_ns: u64, venue: &Venue) -> Stri
     body.to_string()
 }
 
+
+/// `GET /smile?asset=ETH` — implied vol against strike, one curve per tenor.
+///
+/// These are the engine's own vols, from the same smile function that prices the
+/// legs of every spread on the ladder: `σ(K) = σ_atm · (1 + skew · ln(S/K))`. The
+/// smile built from *spread* prices is a different and much noisier object — a
+/// spread has two strikes and its vol explodes at the wings — so the ladder's IV
+/// column and this chart are answered by the same model rather than by inverting a
+/// number that was never a single option's price.
+pub fn smile_json(
+    asset: Asset,
+    spot: Option<f64>,
+    atm_vol: f64,
+    now_ns: u64,
+    expiries: &[u64],
+    tenors: usize,
+) -> String {
+    const YEAR_NS: f64 = 365.0 * 24.0 * 3_600.0 * 1e9;
+    let Some(spot) = spot.filter(|value| *value > 0.0) else {
+        return json!({ "asset": asset.symbol(), "spot": null, "atmVol": atm_vol, "expiries": [] })
+            .to_string();
+    };
+    let curves: Vec<serde_json::Value> = expiries
+        .iter()
+        .copied()
+        .filter(|expiry| *expiry > now_ns)
+        .take(tenors)
+        .map(|expiry| {
+            let years = (expiry - now_ns) as f64 / YEAR_NS;
+            let points: Vec<serde_json::Value> = (0..=SMILE_POINTS)
+                .map(|step| {
+                    let fraction = 0.85 + (0.30 * step as f64 / SMILE_POINTS as f64);
+                    let strike = spot * fraction;
+                    let vol = surface::pricing::smile_vol(spot, strike, atm_vol, surface::pricing::DEFAULT_SKEW)
+                        .max(0.01);
+                    json!({ "strike": (strike * 100.0).round() / 100.0, "vol": vol })
+                })
+                .collect();
+            json!({ "expiryNs": expiry.to_string(), "years": years, "atmVol": atm_vol, "points": points })
+        })
+        .collect();
+    json!({
+        "asset": asset.symbol(),
+        "spot": spot,
+        "atmVol": atm_vol,
+        // The centre of every curve, so a reader can see the skew is the same
+        // function at every tenor and only the time to expiry differs.
+        "skew": surface::pricing::DEFAULT_SKEW,
+        "expiries": curves,
+    })
+    .to_string()
+}
+
+/// How many points a smile is drawn from. Enough to look like a curve, few enough
+/// that the payload stays a chart rather than a series.
+pub const SMILE_POINTS: usize = 24;
+
 /// `GET /index?asset=ETH` — the print a reporter is allowed to put on chain.
 ///
 /// The scaling happens here rather than in the caller because this is the last
@@ -324,6 +381,7 @@ pub fn feed_json(tape: &Tape, assets: &[Asset], now_ms: u64, options: &Options, 
 pub enum Route {
     Health,
     State(Asset, Option<u64>),
+    Smile(Asset),
     Plan(Asset, u64),
     Index(Asset, u128),
     Feed,
@@ -358,6 +416,7 @@ pub fn route(path: &str) -> Route {
             asset,
             found.get("expiry_ns").and_then(|value| value.parse::<u64>().ok()),
         ),
+        "/smile" => Route::Smile(asset),
         "/plan" => match found.get("expiry_ns").and_then(|value| value.parse::<u64>().ok()) {
             Some(expiry_ns) => Route::Plan(asset, expiry_ns),
             None => Route::Unknown,
@@ -474,6 +533,41 @@ mod tests {
         // Every expiry past: the schedule still answers, so a stopped venue
         // reports the last ladder rather than an empty one.
         assert_eq!(upcoming(&all, now + 4 * hour), all);
+    }
+
+    #[test]
+    fn the_smile_is_the_engines_own_function_at_every_tenor() {
+        let hour = 3_600_000_000_000u64;
+        let now = 1_793_280_000 * 1_000_000_000;
+        let expiries = vec![now + hour, now + 12 * hour, now + 30 * hour, now + 60 * hour];
+        let body: serde_json::Value =
+            serde_json::from_str(&smile_json(Asset::Eth, Some(2_300.0), 0.6, now, &expiries, 3))
+                .expect("a smile");
+        assert_eq!(body["spot"], 2300.0);
+        let curves = body["expiries"].as_array().expect("curves");
+        assert_eq!(curves.len(), 3, "three tenors, the fourth is not drawn");
+        assert!(curves[0]["expiryNs"].as_str().unwrap().parse::<u64>().unwrap() < now + 12 * hour);
+        let points = curves[0]["points"].as_array().expect("points");
+        assert_eq!(points.len(), SMILE_POINTS + 1, "an even sweep of strikes");
+        let strikes: Vec<f64> = points.iter().map(|p| p["strike"].as_f64().unwrap()).collect();
+        assert!(strikes.windows(2).all(|pair| pair[0] < pair[1]), "strike ascending");
+        // At the money the smile is the model's atm vol, by definition.
+        let at_index = points
+            .iter()
+            .min_by(|a, b| {
+                (a["strike"].as_f64().unwrap() - 2_300.0)
+                    .abs()
+                    .partial_cmp(&(b["strike"].as_f64().unwrap() - 2_300.0).abs())
+                    .unwrap()
+            })
+            .unwrap();
+        assert!((at_index["vol"].as_f64().unwrap() - 0.6).abs() < 0.02);
+        // And it skews the way the model does: lower strikes carry more vol.
+        assert!(points.first().unwrap()["vol"].as_f64().unwrap() > points.last().unwrap()["vol"].as_f64().unwrap());
+        // No index, no curve: a smile with no money in it is not a chart.
+        let empty: serde_json::Value =
+            serde_json::from_str(&smile_json(Asset::Eth, None, 0.6, now, &expiries, 3)).unwrap();
+        assert_eq!(empty["expiries"].as_array().unwrap().len(), 0);
     }
 
     #[test]

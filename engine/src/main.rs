@@ -180,6 +180,26 @@ fn handle(stream: &mut TcpStream, tape: &Arc<Mutex<Tape>>, config: &Config, expi
             });
             respond(stream, &body.to_string(), "200 OK");
         }
+        Route::Smile(asset) => {
+            let (spot, summary) = {
+                let guard = tape.lock().expect("the tape is only held while copying prints out of it");
+                let summary = guard.summary(asset, now_ms(), &config.venue.stale);
+                (summary.observation(now_ms()).map(|observation| observation.price), summary)
+            };
+            let _ = summary;
+            let body = serve::smile_json(
+                asset,
+                spot,
+                config.venue.atm_vol,
+                now_ns(),
+                &serve::upcoming(expiries, now_ns()),
+                // One curve: the model carries a single σ_atm, so a second tenor
+                // would be the same line drawn again. When the surface grows a term
+                // structure, this number is the only thing that changes.
+                1,
+            );
+            respond(stream, &body, "200 OK");
+        }
         Route::State(asset, wanted) => {
             let expiry_ns = wanted.unwrap_or_else(|| serve::upcoming(expiries, now_ns())[0]);
             let (body, listed, summary) = {
