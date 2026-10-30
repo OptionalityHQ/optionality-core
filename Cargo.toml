@@ -9,6 +9,7 @@ members = [
     "integration-tests",
     "tools/chain-host",
     "tools/oracle-signer",
+    "tools/oracle-sources",
 ]
 resolver = "2"
 

@@ -333,9 +333,9 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "near-workspaces",
+ "oracle-sources",
  "serde_json",
  "tokio",
- "ureq",
 ]
 
 [[package]]
@@ -2553,6 +2553,15 @@ dependencies = [
  "bounded-core",
  "ed25519-dalek",
  "hex",
+ "oracle-sources",
+]
+
+[[package]]
+name = "oracle-sources"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

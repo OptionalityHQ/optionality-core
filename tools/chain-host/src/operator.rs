@@ -176,48 +176,6 @@ pub fn series_count(stats: &Value) -> Option<u64> {
     stats.get("series_count").and_then(Value::as_u64)
 }
 
-/// A print the engine says is reportable, in the oracle's own units.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Print {
-    pub price_units: u128,
-    pub publish_time_ns: u64,
-    pub confidence_bps: u64,
-}
-
-/// Read `GET /index`.
-///
-/// A body without a price is the engine saying it has no index — no prints, or
-/// none fresh — and its `reason` travels with the error. A body *with* a price is
-/// read whatever its `quotable` flag says: quotable is the venue's appetite for
-/// making markets on the number, while the series' `min_confidence_bps` is the
-/// chain's rule for settling on it, and the confidence always carries how much
-/// the venues disagreed.
-pub fn parse_print(body: &str) -> Result<Print, String> {
-    let value: Value = serde_json::from_str(body).map_err(|e| format!("index is not JSON: {e}"))?;
-    if value.get("priceUnits").is_none() {
-        let reason = value
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("no reason given");
-        return Err(format!("engine has no print: {reason}"));
-    }
-    let price_units = amount(value.get("priceUnits").ok_or("priceUnits is missing")?)
-        .ok_or("priceUnits is not an integer")?;
-    let publish_time_ns = integer(&value, "publishTimeNs")?;
-    let confidence_bps = integer(&value, "confidenceBps")?;
-    if price_units == 0 {
-        return Err("a print of zero units is not a price".to_string());
-    }
-    if confidence_bps > 10_000 {
-        return Err(format!("confidence {confidence_bps} bps is not a fraction"));
-    }
-    Ok(Print { price_units, publish_time_ns, confidence_bps })
-}
-
-/// Which of the chain's series need a print *now*. Anything already Fixed,
-/// Pending or Void is not due, and anything past its accept window is no longer
-/// fixable — that one is a void for the holder, and reporting into it would only
-/// fail on chain.
 /// How long the contract lets a venue quote stay payable, for a series on this
 /// ladder. It mirrors the contract's own two tiers: a market inside a day is
 /// quoted as if it were live, and a week-out market can be renewed less often
@@ -742,53 +700,6 @@ mod tests {
             (3, Value::Null),
         ];
         assert!(due_for_fix(&rows, 10_000).is_empty(), "no expiry is not an expired series");
-    }
-
-    #[test]
-    fn a_reportable_print_carries_the_oracles_own_types() {
-        let print = parse_print(
-            &json!({
-                "quotable": true, "price": 2350.4, "priceUnits": 2_350_400_000u64,
-                "publishTimeNs": 1_793_182_584_500_000_000u64, "confidenceBps": 9_790u64,
-            })
-            .to_string(),
-        )
-        .expect("a print");
-        assert_eq!(print.price_units, 2_350_400_000);
-        assert_eq!(print.publish_time_ns, 1_793_182_584_500_000_000);
-        assert_eq!(print.confidence_bps, 9_790);
-    }
-
-    #[test]
-    fn an_unreportable_index_is_refused_with_its_reason() {
-        let error =
-            parse_print(&json!({"quotable": false, "reason": "one source is not an index"}).to_string()).unwrap_err();
-        assert!(error.contains("one source is not an index"), "{error}");
-        assert!(parse_print("{}").unwrap_err().contains("no reason given"), "a bare body is not a print");
-        assert!(parse_print(&json!({"quotable": false, "reason": "x"}).to_string())
-            .unwrap_err()
-            .contains("x"));
-        assert!(parse_print(&json!({"quotable": true}).to_string()).unwrap_err().contains("no print"));
-        // A print the venue would not *quote* is still a print the chain may
-        // settle on: the confidence carries the disagreement, and the series'
-        // own floor is the gate.
-        let degraded = parse_print(
-            &json!({"quotable": false, "priceUnits": 1u64, "publishTimeNs": 1u64, "confidenceBps": 4_000u64})
-                .to_string(),
-        )
-        .expect("a degraded print is still a print");
-        assert_eq!(degraded.confidence_bps, 4_000);
-        assert!(parse_print(
-            &json!({"quotable": true, "priceUnits": 0u64, "publishTimeNs": 1u64, "confidenceBps": 1u64}).to_string()
-        )
-        .unwrap_err()
-        .contains("zero units"));
-        assert!(parse_print(
-            &json!({"quotable": true, "priceUnits": 1u64, "publishTimeNs": 1u64, "confidenceBps": 10_001u64}).to_string()
-        )
-        .unwrap_err()
-        .contains("not a fraction"));
-        assert!(parse_print("garbage").unwrap_err().contains("not JSON"));
     }
 
     fn cell(low: u128, high: u128, mid: u128) -> Value {

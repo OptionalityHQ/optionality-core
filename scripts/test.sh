@@ -16,4 +16,5 @@ cargo test -p engine
 cargo test -p integration-tests --test e2e -- --test-threads=1
 cargo test -p chain-host
 cargo test -p oracle-signer
+cargo test -p oracle-sources
 node --test api/test/*.test.ts

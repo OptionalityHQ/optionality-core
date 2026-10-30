@@ -1,0 +1,12 @@
+[package]
+name = "oracle-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The four reads a seat can do for itself. Kept separate from both binaries so the
+# seat that signs and the relay that delivers agree on what was read.
+[dependencies]
+serde_json = "1"
+ureq = "3.5.0"

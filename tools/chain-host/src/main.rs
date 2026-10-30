@@ -315,7 +315,6 @@ async fn feed_committee(
     admin: &Account,
     oracle: &Contract,
     seats: &[oracle::Seat],
-    engine: &str,
     last_print_ns: &mut std::collections::HashMap<String, u64>,
     complaints: &mut std::collections::HashMap<String, String>,
     waited: &mut [u64],
@@ -324,38 +323,37 @@ async fn feed_committee(
     let mut batch = Vec::new();
     for (index, seat) in seats.iter().enumerate() {
         waited[index] += tick_secs;
-        if waited[index] < oracle::every_secs(seat.name) {
+        if waited[index] < oracle_sources::every_secs(seat.name) {
             continue;
         }
         waited[index] = 0;
-        for feed in &oracle::FEEDS {
+        for feed in &oracle_sources::FEEDS {
             let key = format!("{}|{}", seat.name, feed.id);
-            let tick = match oracle::fetch(seat.name, feed, engine) {
-                Ok(tick) => tick,
-                // One silent source costs the committee a vote, not a settlement:
-                // a quorum of the others still fixes. Said once per distinct
-                // problem, because a feed that is down is down every pass.
+            // The seat fetches and signs; this loop only decides whether to deliver.
+            // A feed that is down, or a source that will not answer, costs the
+            // committee one vote rather than a settlement — and is said once per
+            // distinct problem, because a feed that is down is down every pass.
+            let observation = match seat.observe(feed.id) {
+                Ok(observation) => observation,
                 Err(error) => {
-                    complain(complaints, &key, format!("{} says nothing about {}: {error}", seat.name, feed.id));
+                    complain(
+                        complaints,
+                        &key,
+                        format!("{} says nothing about {}: {error}", seat.name, feed.id),
+                    );
                     continue;
                 }
             };
-            if last_print_ns.get(&key).is_some_and(|last| tick.publish_time_ns <= *last) {
+            if last_print_ns
+                .get(&key)
+                .is_some_and(|last| observation.publish_time_ns <= *last)
+            {
                 // The same print again, or an older one. The oracle would refuse
                 // it, and repeating it every eight seconds is noise.
                 continue;
             }
-            match seat.observation(feed.id, &tick) {
-                Ok(item) => {
-                    last_print_ns.insert(key, tick.publish_time_ns);
-                    batch.push(item);
-                }
-                // A signer that will not sign costs the committee one vote for one
-                // feed; the rest of the batch still goes.
-                Err(error) => {
-                    complain(complaints, &key, format!("{} could not sign {}: {error}", seat.name, feed.id))
-                }
-            }
+            last_print_ns.insert(key, observation.publish_time_ns);
+            batch.push(observation.item(seat.name, feed.id));
         }
     }
     if batch.is_empty() {
@@ -528,6 +526,9 @@ async fn fund(env_admin: &Account, token: &Contract, options: &Contract, role: &
 #[tokio::main]
 async fn main() -> Result<()> {
     let out = PathBuf::from(arg("--out", "data/chain-session.json"));
+    // Read before the committee starts: the venue's own seat needs the engine's URL
+    // to fetch its own index, and a seat is started before anything is listed.
+    let engine = optional("--engine");
     let spot: u128 = arg("--spot", "2350").parse().context("--spot must be a number")?;
     let width: u128 = arg("--width", "100").parse().context("--width must be a number")?;
 
@@ -564,8 +565,11 @@ async fn main() -> Result<()> {
     // inside the signer process that owns it — the relay that fetches prices can
     // ask for a signature and cannot make one, and venue.sh stops those
     // processes with the rest.
-    let (seats, signers) = oracle::start_committee(Path::new("data/oracle"))
-        .map_err(|error| anyhow::anyhow!("starting the committee: {error}"))?;
+    let (seats, signers) = oracle::start_committee(
+        Path::new("data/oracle"),
+        engine.as_deref().unwrap_or_default(),
+    )
+    .map_err(|error| anyhow::anyhow!("starting the committee: {error}"))?;
     for seat in &seats {
         admin
             .call(oracle.id(), "add_source")
@@ -629,7 +633,6 @@ async fn main() -> Result<()> {
         println!("vault opened with {} USDT of equity", LP_SEED);
     }
 
-    let engine = optional("--engine");
     let list_secs: u64 = arg("--list-secs", "300").parse().context("--list-secs must be seconds")?;
     // A seeded maker is a demo convenience, not a business: it is a real account
     // with real escrowed collateral, and it can lose money like anyone else.
@@ -724,11 +727,11 @@ async fn main() -> Result<()> {
     // Feed the committee before the screen opens. The first paint should show a
     // table with prices in it rather than four empty seats, and a settlement that
     // comes due minutes from now should not depend on this loop ever having run.
-    if let Some(url) = &engine {
+    if engine.is_some() {
         let mut printed = std::collections::HashMap::new();
         let mut complaints = std::collections::HashMap::new();
         let mut ready = vec![1_000u64; seats.len()];
-        match feed_committee(&admin, &oracle, &seats, url, &mut printed, &mut complaints, &mut ready, 1)
+        match feed_committee(&admin, &oracle, &seats, &mut printed, &mut complaints, &mut ready, 1)
             .await
         {
             Ok(accepted) => println!("committee opened with {accepted} signed prices"),
@@ -738,8 +741,7 @@ async fn main() -> Result<()> {
         // reads every series back from the chain and takes half a minute when the
         // venue is full; a seat that only speaks once per pass would then be
         // stale by the contract's own clock at the moment a ticket needs it.
-        let (admin, oracle, seats, engine_url) =
-            (admin.clone(), oracle.clone(), seats.clone(), url.clone());
+        let (admin, oracle, seats) = (admin.clone(), oracle.clone(), seats.clone());
         tokio::spawn(async move {
             let mut printed = std::collections::HashMap::new();
             let mut complaints = std::collections::HashMap::new();
@@ -750,7 +752,6 @@ async fn main() -> Result<()> {
                     &admin,
                     &oracle,
                     &seats,
-                    &engine_url,
                     &mut printed,
                     &mut complaints,
                     &mut waited,
