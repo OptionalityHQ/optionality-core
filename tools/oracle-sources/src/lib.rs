@@ -54,7 +54,7 @@ pub const PYTH_CONTRACT: &str = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a";
 pub const PYTH_RPC: &str = "https://mainnet.base.org";
 
 /// A seat's price for one feed, in the contract's own units.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tick {
     pub price_units: u128,
     pub publish_time_ns: u64,

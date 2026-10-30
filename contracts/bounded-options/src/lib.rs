@@ -381,7 +381,21 @@ fn usable_fix(obs: &PriceObservation, series: &Series, now: u64) -> bool {
         && obs.publish_time_ns >= series.expiry_ns
         && obs.publish_time_ns <= series.accept_until_ns
         && obs.confidence_bps >= series.min_confidence_bps
-        && obs.sources.len() >= MIN_SOURCES_FOR_FIX
+        && distinct_sources(&obs.sources).len() >= MIN_SOURCES_FOR_FIX
+}
+
+/// The named sources, once each.
+///
+/// Two is a count of *entries*, and an oracle that repeats one name satisfies it
+/// while still being one party's word — which is exactly what this layer exists to
+/// refuse. The list is sorted and deduplicated here, and what the series stores is
+/// this list, so the provenance a ticket reports is the number of voices that
+/// actually stood behind its price.
+fn distinct_sources(sources: &[String]) -> Vec<String> {
+    let mut names = sources.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 #[near(contract_state)]
@@ -1478,7 +1492,7 @@ impl Contract {
         series.settlement = match chosen {
             Some(obs) => {
                 series.settle_dispersion_bps = obs.dispersion_bps;
-                series.settle_sources = obs.sources;
+                series.settle_sources = distinct_sources(&obs.sources);
                 Settlement::Fixed { price: obs.price, publish_time_ns: obs.publish_time_ns }
             }
             None => Settlement::Open,
@@ -4040,6 +4054,20 @@ mod tests {
     fn one_read_cannot_ask_for_the_world() {
         let contract = setup();
         contract.get_series_many((0..129u64).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn one_source_named_twice_is_still_one_source() {
+        let mut contract = setup();
+        let row = settled_series(&mut contract);
+        let twice = fix(105 * SCALE, T0 + 61_000_000_000, 10_000, &["venue-index", "venue-index"]);
+        assert!(
+            !usable_fix(&twice, &row, T0 + 62_000_000_000),
+            "a count of entries is not a count of voices"
+        );
+        let three = fix(105 * SCALE, T0 + 61_000_000_000, 9_995, &["venue-index", "kraken", "venue-index"]);
+        assert!(usable_fix(&three, &row, T0 + 62_000_000_000), "and the honest pair still passes");
+        assert_eq!(distinct_sources(&three.sources), vec!["kraken".to_string(), "venue-index".to_string()]);
     }
 
     #[test]

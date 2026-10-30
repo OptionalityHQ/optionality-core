@@ -17,9 +17,19 @@
 use bounded_core::oracle::signing_message;
 use ed25519_dalek::{Signer, SigningKey};
 use oracle_sources::{Tick, FEEDS};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// How often a seat will re-read a source, however often it is asked.
+///
+/// The socket is a door to somebody else's server: without this, any local process
+/// could put a loop on `observe` and have the seat hammer Kraken until the seat —
+/// and with it a vote — is rate limited out of the committee.
+const MIN_FETCH_GAP: Duration = Duration::from_secs(1);
 
 fn main() -> std::io::Result<()> {
     let name = arg("--name", "seat");
@@ -33,10 +43,11 @@ fn main() -> std::io::Result<()> {
     // A socket left by a killed run would fail to bind; nothing else lives here.
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
+    let cache: RefCell<HashMap<String, (Instant, Tick)>> = RefCell::new(HashMap::new());
     println!("ready {name} {}", hex::encode(key.verifying_key().to_bytes()));
     std::io::stdout().flush()?;
     for stream in listener.incoming().flatten() {
-        if let Err(error) = serve(stream, &name, &source, &engine, &key) {
+        if let Err(error) = serve(stream, &name, &source, &engine, &key, &cache) {
             eprintln!("{name}: {error}");
         }
     }
@@ -51,17 +62,20 @@ fn serve(
     source: &str,
     engine: &str,
     key: &SigningKey,
+    cache: &RefCell<HashMap<String, (Instant, Tick)>>,
 ) -> std::io::Result<()> {
     let mut line = String::new();
     if BufReader::new(stream.try_clone()?).read_line(&mut line)? == 0 {
         return Ok(());
     }
     let fetch = |feed: &str| -> Result<Tick, String> {
-        let known = FEEDS
-            .iter()
-            .find(|entry| entry.id == feed)
-            .ok_or_else(|| format!("{feed} is not a feed this seat reads"))?;
-        oracle_sources::fetch(source, known, engine)
+        observe_cached(cache, feed, &|feed| {
+            let known = FEEDS
+                .iter()
+                .find(|entry| entry.id == feed)
+                .ok_or_else(|| format!("{feed} is not a feed this seat reads"))?;
+            oracle_sources::fetch(source, known, engine)
+        })
     };
     let reply = answer(line.trim(), name, key, &fetch);
     writeln!(stream, "{reply}")?;
@@ -110,6 +124,24 @@ fn answer(
         }
         _ => "err unknown request".to_string(),
     }
+}
+
+/// One fetch a second per feed, and the same answer for everyone in between. The
+/// relay asks on its own cadence; a caller in a loop gets the cached observation,
+/// which the oracle would refuse as a replay anyway.
+fn observe_cached(
+    cache: &RefCell<HashMap<String, (Instant, Tick)>>,
+    feed: &str,
+    fetch: &dyn Fn(&str) -> Result<Tick, String>,
+) -> Result<Tick, String> {
+    if let Some((at, tick)) = cache.borrow().get(feed) {
+        if at.elapsed() < MIN_FETCH_GAP {
+            return Ok(*tick);
+        }
+    }
+    let tick = fetch(feed)?;
+    cache.borrow_mut().insert(feed.to_string(), (Instant::now(), tick));
+    Ok(tick)
 }
 
 fn arg(name: &str, fallback: &str) -> String {
@@ -200,6 +232,24 @@ mod tests {
         let reply = answer("observe BTC-USD", "kraken", &key(), &failing);
         assert!(reply.starts_with("err kraken says nothing"), "{reply}");
         assert!(answer("observe", "kraken", &key(), &seen(1)).starts_with("err observe wants"));
+    }
+
+
+    #[test]
+    fn a_loop_on_the_socket_does_not_become_a_loop_on_the_source() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let cache: RefCell<HashMap<String, (Instant, Tick)>> = RefCell::new(HashMap::new());
+        let fetch = |_feed: &str| -> Result<Tick, String> {
+            calls.set(calls.get() + 1);
+            Ok(Tick { price_units: 7, publish_time_ns: 1, confidence_bps: 9_900 })
+        };
+        for _ in 0..25 {
+            observe_cached(&cache, "BTC-USD", &fetch).expect("an observation");
+        }
+        assert_eq!(calls.get(), 1, "twenty-five asks, one read of the source");
+        observe_cached(&cache, "ETH-USD", &fetch).expect("its own cache line");
+        assert_eq!(calls.get(), 2, "and each feed has its own");
     }
 
     #[test]
