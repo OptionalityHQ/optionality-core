@@ -46,6 +46,12 @@ pub struct Quote {
     pub mark_iv: Option<f64>,
     pub bid_iv: Option<f64>,
     pub ask_iv: Option<f64>,
+    /// The vol at the two prices the vault actually charges — the loaded entry a
+    /// buyer pays and the haircut exit a holder is paid. The screen's ask column
+    /// shows the vault's price, so an IV solved at the model's ask described a
+    /// number nobody could trade at.
+    pub entry_iv: Option<f64>,
+    pub exit_iv: Option<f64>,
     /// The integer the venue trades on: `mid_units` is what `pool_buy` prices
     /// from, and everything below is what it costs.
     pub mid_units: u128,
@@ -128,6 +134,12 @@ pub fn half_spread(mark: f64) -> f64 {
 /// JavaScript column print 300% on every near-money spread — that was the end of
 /// its own search bracket, not a volatility. So this finds the slope, solves
 /// against it, and says `None` when a price has no vol behind it.
+/// A ticket's integer premium, back to one contract's price in dollars.
+fn unit_price(units: u128, quantity_units: u128, scale: u128) -> f64 {
+    let quantity = quantity_units.max(1) as f64;
+    units as f64 / quantity / scale as f64
+}
+
 pub fn implied_vol(price: f64, cell: &Cell, model: &Model) -> Option<f64> {
     if !price.is_finite() || price <= 0.0 || model.years <= 0.0 {
         return None;
@@ -203,6 +215,11 @@ pub fn quote(cell: &Cell, model: &Model, scale: u128, quantity_units: u128, term
         mark_iv: implied_vol(mark, cell, model),
         bid_iv: implied_vol(bid, cell, model),
         ask_iv: implied_vol(ask, cell, model),
+        // The vault does not trade at the model's ask: it charges the mid plus its
+        // margin and pays the mid minus its haircut. Those are the prices on the
+        // screen, so those are the prices whose vol the columns should name.
+        entry_iv: implied_vol(unit_price(entry_units, quantity_units, scale), cell, model),
+        exit_iv: implied_vol(unit_price(exit_units, quantity_units, scale), cell, model),
         mid_units,
         entry_units,
         exit_units,
@@ -415,6 +432,45 @@ mod tests {
         // volatility that reproduces it, so the column must say "—" rather than
         // print the end of the search bracket, which is what the old solver did.
         assert_eq!(q.ask_iv, None, "{:?}", (q.mark, q.ask, q.ask_iv));
+    }
+
+    #[test]
+    fn the_iv_columns_name_the_price_they_sit_beside() {
+        // A wing the model can solve: the entry is dearer than the exit, and for a
+        // call that means a higher vol — so the two columns must differ, and the
+        // dearer one must be the one on the ask side.
+        let wing = priced(
+            2350.0,
+            2600.0,
+            2700.0,
+            Kind::Call,
+            0.6,
+            7.0 / 365.0,
+            SCALE,
+            THREE,
+            &Terms::STANDARD,
+        )
+        .expect("a wing quotes");
+        let entry = wing.entry_iv.expect("the entry price solves");
+        let exit = wing.exit_iv.expect("the exit price solves");
+        assert!(entry > exit, "the loaded entry is dearer, so its vol is higher: {entry} vs {exit}");
+        assert!((entry - wing.ask_iv.unwrap()).abs() > 1e-6, "and it is not the model's ask either");
+
+        // The ticket's size changes the integer premium, not the price per
+        // contract, so it cannot change the vol a column reports.
+        let five = priced(
+            2350.0,
+            2600.0,
+            2700.0,
+            Kind::Call,
+            0.6,
+            7.0 / 365.0,
+            SCALE,
+            5 * THREE,
+            &Terms::STANDARD,
+        )
+        .expect("a wing quotes");
+        assert!((five.entry_iv.unwrap() - entry).abs() < 1e-9, "five tickets, one price");
     }
 
     #[test]

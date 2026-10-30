@@ -154,6 +154,11 @@ fn side(
         "markIv": q.mark_iv,
         "bidIv": q.bid_iv,
         "askIv": q.ask_iv,
+        // The vol at the two prices the vault actually charges. The ask column on
+        // the screen shows the entry, so that is the number it carries; the exit is
+        // what closes a held ticket, and it is not a bid anybody can write into.
+        "entryIv": if openable { json!(q.entry_iv) } else { Value::Null },
+        "exitIv": if exitable { json!(q.exit_iv) } else { Value::Null },
         "delta": q.delta,
         "gamma": q.gamma,
         "vega": q.vega,
