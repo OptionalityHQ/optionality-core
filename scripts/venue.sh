@@ -53,6 +53,9 @@ done
 mkdir -p "$LOGS" data
 ./scripts/build.sh
 cargo build -q -p engine -p chain-host
+# The page the gateway serves is the template's output, so building the venue
+# without rebuilding the page would serve yesterday's screen from today's chain.
+node sim/build-demo.mjs
 
 nohup ./target/debug/engine --port "$ENGINE_PORT" --assets "$ASSETS" \
   --expiry-hours "$EXPIRY_HOURS" > "$LOGS/engine.log" 2>&1 &
@@ -63,10 +66,21 @@ nohup ./target/debug/chain-host --out "$SESSION" \
   --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" > "$LOGS/host.log" 2>&1 &
 
 echo "booting the sandbox and listing the engine's ladder (watch $LOGS/host.log)…"
-for _ in $(seq 1 90); do
-  grep -qE "listed [0-9]+ of|ladder unchanged|ready" "$LOGS/host.log" 2>/dev/null && break
+# The gate is the session file being *written*, not the ladder being listed: the
+# host quotes the vault after listing, and a gateway that starts in between reads
+# the previous run's session — a dead RPC and yesterday's series. Waiting out the
+# budget is reported rather than papered over, because a gateway pointed at a stale
+# session serves a screen that looks alive and reverts every trade it plans.
+ready=no
+for _ in $(seq 1 120); do
+  grep -q "session written" "$LOGS/host.log" 2>/dev/null && { ready=yes; break; }
   sleep 2
 done
+if [ "$ready" != yes ]; then
+  echo "the operator never wrote $SESSION · see $LOGS/host.log" >&2
+  tail -6 "$LOGS/host.log" >&2
+  exit 1
+fi
 tail -4 "$LOGS/host.log"
 
 nohup node api/src/server.ts --session "$SESSION" \

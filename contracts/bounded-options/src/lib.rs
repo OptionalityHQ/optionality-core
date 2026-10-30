@@ -29,6 +29,13 @@ const MAX_ACCEPT_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 const MAX_FINALIZE_WINDOW_NS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 const SETTLEMENT_GRACE_NS: u64 = 300 * 1_000_000_000;
 const PRICE_BOUND_FACTOR: u128 = 10;
+/// How long a venue quote stays payable. The vault only trades at a price the
+/// venue itself published, and a published price is only worth what it said
+/// while it is still current.
+const MAX_QUOTE_AGE_NS: u64 = 60 * 1_000_000_000;
+/// A quote may carry a stamp a little ahead of the chain clock; the gateway and
+/// the host read different clocks and a few milliseconds of skew is normal.
+const MAX_QUOTE_SLACK_NS: u64 = 5 * 1_000_000_000;
 
 #[derive(BorshStorageKey, BorshSerialize)]
 #[borsh(crate = "near_sdk::borsh")]
@@ -44,6 +51,7 @@ enum StorageKey {
     SeriesBids,
     HolderTickets,
     LpShares,
+    PoolQuotes,
 }
 
 #[near(serializers = [json, borsh])]
@@ -176,6 +184,36 @@ pub struct BidView {
 /// The vault as the UI and the LP screen read it. `free_equity` is what the pool
 /// can still stand behind; `utilisation_bps` is the same number as a percentage
 /// of the whole balance sheet.
+/// What the venue last said a series is worth, and when it said it.
+///
+/// The pool used to price from the `mid_units` a caller sent, which is not a
+/// price: any account could buy a $100-worst-case ticket for two units of the
+/// token by naming a tiny mid, and close it for ninety by naming a large one —
+/// about 0.9 × width of other people's money per pair of transactions,
+/// repeatable until the vault was empty. Now the venue publishes the number and
+/// a trade must agree to exactly that.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quote {
+    pub mid_units: u128,
+    pub stamp_ns: u64,
+}
+
+/// What the vault charges and pays for a whole quantity, at its own quote. The
+/// arithmetic is `core::fees`, the same the execution path runs, so a screen
+/// reading this is not estimating the price — it is reading it.
+#[near(serializers = [json])]
+#[derive(Clone)]
+pub struct PoolPrice {
+    pub series_id: u64,
+    pub quantity: U128,
+    pub mid_units: U128,
+    pub entry_units: U128,
+    pub exit_units: U128,
+    pub stamp_ns: u64,
+    pub age_ns: u64,
+}
+
 #[near(serializers = [json])]
 #[derive(Clone)]
 pub struct PoolState {
@@ -323,6 +361,9 @@ pub struct Contract {
     pool_shares: u128,
     /// Shares each LP holds against `pool_shares`.
     lp_shares: LookupMap<AccountId, u128>,
+    /// The venue's own price per series. A trade agrees to it; it does not
+    /// propose one.
+    pool_quotes: LookupMap<u64, Quote>,
     /// Count of open tickets whose maker is the vault.
     pool_tickets: u64,
     venue: AccountId,
@@ -376,6 +417,7 @@ impl Contract {
             pool_consolation: 0,
             pool_shares: 0,
             lp_shares: LookupMap::new(StorageKey::LpShares),
+            pool_quotes: LookupMap::new(StorageKey::PoolQuotes),
             pool_tickets: 0,
             venue,
             margin_bps: fees::Terms::STANDARD.margin_bps,
@@ -436,6 +478,30 @@ impl Contract {
             _ => return amount.0.to_string(),
         }
         "0".to_string()
+    }
+
+    /// The venue's price for a series, and the trade it makes possible. Only
+    /// the venue account may speak for the vault, and a caller may only agree:
+    /// `pool_buy` and `pool_close` require the mid they send to be exactly this
+    /// number, so nobody can name a price that is not the venue's.
+    pub fn set_pool_quote(&mut self, series_id: u64, mid_units: U128, stamp_ns: u64) {
+        self.assert_venue();
+        require!(mid_units.0 > 0, "a quote must be positive");
+        let series = self.series.get(&series_id).expect("series not found");
+        require!(series.settlement == Settlement::Open, "series not open");
+        // A stamp in the future is a quote that never goes stale, which is the
+        // one thing a quote must be able to do.
+        require!(
+            stamp_ns <= env::block_timestamp().saturating_add(MAX_QUOTE_SLACK_NS),
+            "quote stamp is in the future"
+        );
+        self.pool_quotes.insert(
+            series_id,
+            Quote {
+                mid_units: mid_units.0,
+                stamp_ns,
+            },
+        );
     }
 
     pub fn withdraw(&mut self, amount: U128) -> Promise {
@@ -514,6 +580,8 @@ impl Contract {
         oracle_feed: String,
     ) -> u64 {
         self.assert_admin();
+        require!(is_tag(&underlying), "underlying must be a short ticker");
+        require!(is_tag(&oracle_feed), "oracle feed must be a short id");
         let now = env::block_timestamp();
         require!(expiry_ns > now, "expiry must be in the future");
         require!(
@@ -995,26 +1063,27 @@ impl Contract {
     // ---------- player vs pool ----------
 
     /// Buy a bounded spread straight from the vault. The pool is the maker, so
-    /// there is no resting offer to take and the caller only supplies the mid
-    /// the engine marked the series at.
+    /// there is no resting offer to take — and there is nothing for the buyer to
+    /// price either: the trade happens at the quote the venue published
+    /// (`set_pool_quote`) or not at all. A taker sends bounds, not a number.
     ///
-    /// Two bounds make a wrong mark survivable, and neither is trust:
+    /// Three bounds make a wrong mark survivable, and none of them is trust:
+    /// - the vault is protected because it prices itself: a caller cannot buy a
+    ///   spread for less than the venue decided it was worth;
     /// - the buyer is protected by `max_total_premium`, their own slippage
     ///   budget, and by the rule that a ticket can never cost more than the
-    ///  most it can ever pay;
-    /// - the pool is protected by its capacity invariant, so an underpriced
-    ///   mark can drain the equity LPs committed but can never make the vault
-    ///   owe more than it holds.
+    ///   most it can ever pay;
+    /// - the pool is protected by its capacity invariant, so a quote that is
+    ///   generous to buyers can drain the equity LPs committed but can never
+    ///   make the vault owe more than it holds.
     pub fn pool_buy(
         &mut self,
         series_id: u64,
         quantity: U128,
-        mid_units: U128,
         max_total_premium: U128,
     ) -> u64 {
         require!(!self.config.paused, "trading paused");
         require!(quantity.0 > 0, "quantity must be positive");
-        require!(mid_units.0 > 0, "mid must be positive");
         require!(max_total_premium.0 > 0, "premium budget must be positive");
         let buyer = env::predecessor_account_id();
         let now = env::block_timestamp();
@@ -1034,9 +1103,11 @@ impl Contract {
             .high_strike
             .checked_sub(series.low_strike)
             .expect("strike width");
+        // The venue's number, or nothing: a caller cannot price the vault.
+        let mid_units = self.live_quote(series_id);
         let terms = self.terms();
         let premium = terms
-            .entry_premium(quantity.0, mid_units.0, series.price_scale)
+            .entry_premium(quantity.0, mid_units, series.price_scale)
             .expect("premium overflow");
         require!(premium > 0, "premium rounded to zero");
         require!(
@@ -1107,7 +1178,11 @@ impl Contract {
     /// a position to a resting bidder and leaves the maker's obligation alone,
     /// this destroys the position: the pool pays its marked exit value less the
     /// impact haircut and gives back the reservation.
-    pub fn pool_close(&mut self, ticket_id: u64, mid_units: U128) -> U128 {
+    ///
+    /// The price is the venue's, exactly as on the way in — `min_exit_units` is
+    /// the seller's floor, not their bid, and a floor the quote no longer clears
+    /// is a refusal rather than a worse fill.
+    pub fn pool_close(&mut self, ticket_id: u64, min_exit_units: Option<U128>) -> U128 {
         require!(!self.config.paused, "trading paused");
         let seller = env::predecessor_account_id();
         let now = env::block_timestamp();
@@ -1125,10 +1200,20 @@ impl Contract {
         require!(series.settlement == Settlement::Open, "series not open");
         require!(now < series.expiry_ns, "series expired");
 
+        // Selling back is priced by the venue too. Without this the same holder
+        // could name a large mid and be paid 0.9 × width of someone else's
+        // equity for it.
+        let mid_units = self.live_quote(ticket.series_id);
         let exit = self
             .terms()
-            .exit_value(ticket.quantity, mid_units.0, series.price_scale)
+            .exit_value(ticket.quantity, mid_units, series.price_scale)
             .expect("exit overflow");
+        if let Some(floor) = min_exit_units {
+            require!(
+                exit >= floor.0,
+                "the exit fell below the floor the seller set"
+            );
+        }
         let written = self.written_of(&ticket);
         let mut vault = self.load_pool();
         require!(
@@ -1224,18 +1309,18 @@ impl Contract {
     /// source a void refunds from, so sweeping it would strand the settlement.
     /// Nothing here touches `equity`, so collecting fees never dilutes a share.
     pub fn pool_sweep(&mut self) -> U128 {
-        let caller = env::predecessor_account_id();
-        require!(caller == self.venue, "only the venue");
+        self.assert_venue();
+        let venue = self.venue.clone();
         let mut vault = self.load_pool();
         let claimable = vault.sweep_venue();
         self.save_pool(&vault);
         if claimable > 0 {
-            self.credit(&caller, claimable);
+            self.credit(&venue, claimable);
         }
         emit(
             "venue_swept",
             near_sdk::serde_json::json!({
-                "venue": caller,
+                "venue": venue,
                 "amount": claimable,
                 "venue_left": vault.venue
             }),
@@ -1694,6 +1779,45 @@ impl Contract {
         }
     }
 
+    pub fn get_pool_quote(&self, series_id: u64) -> Option<Quote> {
+        self.pool_quotes.get(&series_id).copied()
+    }
+
+    /// What the vault charges and pays for `quantity` at its own quotes, for a
+    /// handful of series at once. A screen that worked these prices out from the
+    /// mark would be quoting a trade the contract might not make: this is
+    /// `core::fees` on the same integers execution uses, so the number shown is
+    /// the number charged. A series with no live quote is simply absent.
+    pub fn get_pool_prices(&self, series_ids: Vec<u64>, quantity: U128) -> Vec<PoolPrice> {
+        require!(series_ids.len() <= 64, "too many series at once");
+        let terms = self.terms();
+        let now = env::block_timestamp();
+        series_ids
+            .iter()
+            .filter_map(|id| {
+                let quote = self.pool_quotes.get(id)?;
+                let series = self.series.get(id)?;
+                if series.settlement != Settlement::Open || quote.mid_units == 0 {
+                    return None;
+                }
+                if now.saturating_sub(quote.stamp_ns) > MAX_QUOTE_AGE_NS {
+                    return None;
+                }
+                let entry = terms.entry_premium(quantity.0, quote.mid_units, series.price_scale)?;
+                let exit = terms.exit_value(quantity.0, quote.mid_units, series.price_scale)?;
+                Some(PoolPrice {
+                    series_id: *id,
+                    quantity: U128(quantity.0),
+                    mid_units: U128(quote.mid_units),
+                    entry_units: U128(entry),
+                    exit_units: U128(exit),
+                    stamp_ns: quote.stamp_ns,
+                    age_ns: now.saturating_sub(quote.stamp_ns),
+                })
+            })
+            .collect()
+    }
+
     pub fn get_lp_shares(&self, account_id: AccountId) -> U128 {
         U128(self.lp_shares.get(&account_id).copied().unwrap_or(0))
     }
@@ -2039,6 +2163,24 @@ impl Contract {
         );
     }
 
+    fn assert_venue(&self) {
+        require!(env::predecessor_account_id() == self.venue, "only the venue");
+    }
+
+    /// The price the vault trades at right now: the venue's own quote for this
+    /// series, if it exists and is still current. A caller contributes bounds to
+    /// a pool trade, never a price — which is the only arrangement that survives
+    /// a moving index, because a price echoed at read time is stale by the time
+    /// the transaction lands.
+    fn live_quote(&self, series_id: u64) -> u128 {
+        let Some(quote) = self.pool_quotes.get(&series_id) else {
+            env::panic_str("the venue has not quoted this series");
+        };
+        let age = env::block_timestamp().saturating_sub(quote.stamp_ns);
+        require!(age <= MAX_QUOTE_AGE_NS, "the venue's quote for this series has expired");
+        quote.mid_units
+    }
+
     fn credit(&mut self, account: &AccountId, amount: u128) {
         if amount == 0 {
             return;
@@ -2126,6 +2268,18 @@ impl Contract {
     }
 }
 
+/// A listing's name is read by everything that follows the chain — explorers,
+/// indexers, a wallet showing a ticker — and none of them can be assumed to
+/// have escaped it. So the vocabulary is fixed at the only boundary that
+/// matters, and the length with it: storage is someone else's rent.
+fn is_tag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn premium_per_unit(premium: u128, quantity: u128) -> u128 {
     premium
         .checked_mul(UNIT_PRECISION)
@@ -2204,6 +2358,53 @@ mod tests {
             5_000,
             "ETH-USD".to_string(),
         )
+    }
+
+    /// The venue names the price the vault will trade at. Every pool trade in
+    /// these tests has to answer to a quote the venue published for itself, so
+    /// this is the line between a vault and a piñata. It stamps at the current
+    /// block time and leaves the clock where it found it.
+    fn quote(contract: &mut Contract, sid: u64, mid: u128) {
+        let stamp = env::block_timestamp();
+        testing_env!(context(accounts(0), stamp).build());
+        contract.set_pool_quote(sid, U128(mid), stamp);
+    }
+
+    fn refused<T>(f: impl FnOnce() -> T) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+    }
+
+    #[test]
+    fn a_series_name_is_a_tag_and_not_a_document() {
+        fn listed(underlying: &str, feed: &str) -> Result<u64, ()> {
+            let mut contract = setup();
+            testing_env!(context(accounts(0), T0).build());
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                contract.create_series(
+                    underlying.to_string(),
+                    SpreadKind::Put,
+                    T0 + 60_000_000_000,
+                    T0 + 120_000_000_000,
+                    T0 + 660_000_000_000,
+                    U128(100 * SCALE),
+                    U128(110 * SCALE),
+                    U128(SCALE),
+                    5_000,
+                    feed.to_string(),
+                )
+            }))
+            .map_err(|_| ())
+        }
+
+        assert_eq!(listed("ETH", "ETH-USD"), Ok(0));
+        assert_eq!(listed("BTC.2", "bybit_perp-btc_usdt"), Ok(0));
+        // Markup is not a ticker. Whoever reads it next did not choose to render
+        // it, so it never gets in.
+        assert_eq!(listed("<img src=x onerror=alert(1)>", "ETH-USD"), Err(()));
+        assert_eq!(listed("ETH", "ETH-USD; DROP"), Err(()));
+        assert_eq!(listed("ETH", ""), Err(()), "an unnamed feed is not a feed");
+        assert_eq!(listed("", "ETH-USD"), Err(()));
+        assert_eq!(listed(&"x".repeat(33), "ETH-USD"), Err(()));
     }
 
     #[test]
@@ -3005,7 +3206,8 @@ mod tests {
         .is_err());
     }
 
-    /// One contract at `mid`, with a `budget` cap, bought by `buyer`.
+    /// One contract at `mid`, with a `budget` cap, bought by `buyer`. The venue
+    /// quotes first: a buyer can only ever pay a price the vault named.
     fn buy_from(
         contract: &mut Contract,
         buyer: AccountId,
@@ -3013,8 +3215,11 @@ mod tests {
         mid: u128,
         budget: u128,
     ) -> u64 {
+        if mid > 0 {
+            quote(contract, sid, mid);
+        }
         testing_env!(context(buyer, T0).build());
-        contract.pool_buy(sid, U128(SCALE), U128(mid), U128(budget))
+        contract.pool_buy(sid, U128(SCALE), U128(budget))
     }
 
     #[test]
@@ -3030,9 +3235,10 @@ mod tests {
             "vault money is not a tradable balance"
         );
 
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0).build());
         // One contract at a 3.00 mid, with a 4.00 budget: the entry is 3.12.
-        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
 
         let vault = contract.get_pool_state();
         assert_eq!(vault.equity.0, 23 * SCALE, "the mid joins equity");
@@ -3092,10 +3298,14 @@ mod tests {
             buy_from(&mut contract, accounts(3), sid, 3 * SCALE, 3 * SCALE)
         }))
         .is_err());
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            buy_from(&mut contract, accounts(3), sid, 0, 10 * SCALE)
-        }))
-        .is_err());
+        // A series the venue has never quoted has no price to buy at — not a
+        // refusal to trade cheaply, simply nothing on the other side.
+        let dark = series(&mut contract);
+        assert!(refused(|| buy_from(&mut contract, accounts(3), dark, 0, 10 * SCALE)));
+        assert_eq!(
+            contract.get_pool_state().open_tickets, 0,
+            "and the unquoted series wrote nothing"
+        );
         // A buyer without the balance cannot open a position, and a rejection
         // leaves the vault exactly as it was.
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3134,8 +3344,9 @@ mod tests {
         let sid = series(&mut contract);
         deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
         fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0).build());
-        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
 
         // Fixed below the low strike: the spread pays its full width.
         let mut fixed = contract.get_series(sid).unwrap();
@@ -3225,8 +3436,9 @@ mod tests {
         let sid = series(&mut contract);
         deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
         fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0).build());
-        contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
 
         // A stranger cannot take the fee.
         testing_env!(context(accounts(4), T0).build());
@@ -3241,10 +3453,13 @@ mod tests {
         assert_eq!(contract.get_balance(accounts(0)).0, 0);
 
         // Hand the position back early and the same slice becomes takeable.
+        quote(&mut contract, sid, 2 * SCALE);
         testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
         let exit = contract.pool_close(
             contract.get_positions(accounts(3), 10)[0].ticket_id,
-            U128(2 * SCALE),
+            // The seller's floor, named where the venue's price is not: taking
+            // half of what the quote clears is a refusal, not a worse fill.
+            Some(U128(900_000)),
         );
         assert_eq!(exit.0, 1_800_000, "2.00 mid less the 10% haircut");
         assert_eq!(contract.get_pool_state().venue.0, 120_000);
@@ -3257,11 +3472,13 @@ mod tests {
         let sid = series(&mut contract);
         deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
         fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0).build());
-        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
 
+        quote(&mut contract, sid, 2 * SCALE);
         testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
-        let exit = contract.pool_close(ticket, U128(2 * SCALE));
+        let exit = contract.pool_close(ticket, None);
         assert_eq!(exit.0, 1_800_000);
         assert!(contract.get_ticket(ticket).is_none(), "the position is gone");
         assert!(contract.get_positions(accounts(3), 10).is_empty());
@@ -3274,10 +3491,11 @@ mod tests {
 
         // Selling back at the same mid the entry used still costs the round
         // trip: the margin in, the haircut out.
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0 + 2_000_000_000).build());
-        let again = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        let again = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
         testing_env!(context(accounts(3), T0 + 3_000_000_000).build());
-        let back = contract.pool_close(again, U128(3 * SCALE));
+        let back = contract.pool_close(again, None);
         assert!(back.0 < 3_120_000, "a round trip cannot be free");
         assert_eq!(contract.expected_custody().0, 120 * SCALE);
     }
@@ -3288,8 +3506,9 @@ mod tests {
         let sid = series(&mut contract);
         deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
         fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0).build());
-        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
 
         testing_env!(context(outsider(), T0 + 700_000_000_000).build());
         contract.void_series(sid);
@@ -3319,8 +3538,9 @@ mod tests {
         let shares = contract.get_lp_shares(accounts(5)).0;
         let mut ticket = Vec::new();
         for _ in 0..2 {
+            quote(&mut contract, sid, 3 * SCALE);
             testing_env!(context(accounts(3), T0).build());
-            ticket.push(contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE)));
+            ticket.push(contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE)));
         }
         assert_eq!(contract.get_pool_state().free_equity.0, 2 * SCALE);
 
@@ -3364,8 +3584,9 @@ mod tests {
         for who in [3, 4] {
             fund(&mut contract, accounts(who), 100 * SCALE);
         }
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0).build());
-        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(4 * SCALE));
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
 
         // Someone else bids for the whole position, and the holder sells into
         // the book rather than back to the vault.
@@ -3422,8 +3643,9 @@ mod tests {
         }))
         .is_err());
 
+        quote(&mut contract, sid, 3 * SCALE);
         testing_env!(context(accounts(3), T0).build());
-        let ticket = contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE), U128(10 * SCALE));
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(10 * SCALE));
         assert_eq!(contract.get_pool_state().margin_bps, 800);
         // 3.00 mid plus 8% = 3.24, of which 0.24 is the venue's.
         let stored = contract.get_ticket(ticket).unwrap();
@@ -3435,7 +3657,7 @@ mod tests {
 
         // Exiting at the same mid now gives back 80% of the mid.
         testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
-        let exit = contract.pool_close(ticket, U128(3 * SCALE));
+        let exit = contract.pool_close(ticket, None);
         assert_eq!(exit.0, 2_400_000);
         assert_eq!(contract.expected_custody().0, 1_100 * SCALE);
         assert_eq!(sweep(&mut contract), 240_000);
@@ -3463,9 +3685,10 @@ mod tests {
         // An empty pool cannot write, however cheap the mark looks.
         fund(&mut contract, accounts(3), 100 * SCALE);
         let sid = series(&mut contract);
+        quote(&mut contract, sid, SCALE);
         testing_env!(context(accounts(3), T0).build());
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            contract.pool_buy(sid, U128(SCALE), U128(SCALE), U128(10 * SCALE))
+            contract.pool_buy(sid, U128(SCALE), U128(10 * SCALE))
         }))
         .is_err());
         // And a share redemption for someone who holds nothing is refused.
@@ -3474,5 +3697,157 @@ mod tests {
             contract.pool_withdraw(U128(SCALE))
         }))
         .is_err());
+    }
+
+    /// The round trip this contract must never allow: buy a ticket for a
+    /// rounding error, then ask the vault to buy it back at a mid made up. At
+    /// 100.00 on a 100/110 put the vault would pay 90.00 for a 3.12 entry, and it
+    /// is other people's equity paying it. The signature answers it: a taker sends
+    /// quantity and bounds, and there is no price argument to lie with.
+    #[test]
+    fn the_caller_cannot_price_the_vault() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 100 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+
+        // With nothing published there is no price to trade at.
+        testing_env!(context(accounts(3), T0).build());
+        assert!(refused(|| contract.pool_buy(sid, U128(SCALE), U128(10 * SCALE))));
+        assert_eq!(contract.get_pool_state().open_tickets, 0);
+
+        // The venue names 3.00, and the vault writes at 3.12 — whatever the
+        // buyer hoped. A budget under the quote is the buyer's own protection.
+        quote(&mut contract, sid, 3 * SCALE);
+        testing_env!(context(accounts(3), T0).build());
+        assert!(refused(|| contract.pool_buy(sid, U128(SCALE), U128(3 * SCALE))));
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
+        assert_eq!(
+            contract.get_ticket(ticket).unwrap().premium,
+            3_120_000,
+            "the entry is the venue's arithmetic, not the caller's"
+        );
+
+        // The sell half pays the vault's exit at *its* quote. A holder can only
+        // refuse a price that is too low, never name one that is too high.
+        quote(&mut contract, sid, 3 * SCALE);
+        testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
+        assert!(refused(|| contract.pool_close(ticket, Some(U128(90 * SCALE)))));
+        assert_eq!(
+            contract.get_ticket(ticket).unwrap().buyer,
+            accounts(3),
+            "a refused close must not destroy the position"
+        );
+        assert_eq!(
+            contract.get_balance(accounts(3)).0,
+            100 * SCALE - 3_120_000,
+            "and must not pay anything either"
+        );
+        assert_eq!(contract.pool_close(ticket, Some(U128(2_690_000))).0, 2_700_000);
+
+        // A stranger cannot answer for the venue, or move its price.
+        testing_env!(context(accounts(4), T0).build());
+        assert!(refused(|| contract.set_pool_quote(sid, U128(100 * SCALE), T0)));
+        assert_eq!(contract.get_pool_quote(sid).unwrap().mid_units, 3 * SCALE);
+    }
+
+    /// A quote is a price *now*. A taker who read it a moment ago does not get
+    /// that price — they get the one standing when the transaction lands, and
+    /// their own budget is what protects them from it having moved. This is the
+    /// arrangement a live index forces on a vault: echoing a price back cannot
+    /// work, because the echo is stale before the call is signed.
+    #[test]
+    fn a_taker_gets_the_price_standing_when_the_trade_lands() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 1_000 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
+
+        testing_env!(context(accounts(3), T0).build());
+        let seen = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
+        assert_eq!(contract.get_ticket(seen).unwrap().premium, 3_120_000);
+
+        // The index moves and the venue re-prices before the next click lands.
+        quote(&mut contract, sid, 6 * SCALE);
+        testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
+        // The budget carried over from the old quote: refused, and loudly.
+        assert!(refused(|| contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE))));
+        // The same order, sized to what the vault now charges, fills at the new
+        // price — 6.00 loaded to 6.24, not the 3.12 the screen first showed.
+        let later = contract.pool_buy(sid, U128(SCALE), U128(7 * SCALE));
+        assert_eq!(contract.get_ticket(later).unwrap().premium, 6_240_000);
+    }
+
+    /// A quote is an offer to trade at a price *now*. Reusing one from last week
+    /// is the same bug as letting the caller choose it, so the vault stops
+    /// honouring it on the clock rather than on the number.
+    #[test]
+    fn an_expired_quote_is_not_a_price() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 100 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
+
+        // The list outlives the quote, so what fails here is the clock and not
+        // the expiry: the series below stays open for a minute past the age.
+        let mut wide = contract.get_series(sid).unwrap();
+        wide.expiry_ns = T0 + 600_000_000_000;
+        contract.series.insert(sid, wide);
+
+        let later = T0 + MAX_QUOTE_AGE_NS + 1_000_000_000;
+        testing_env!(context(accounts(3), later).build());
+        assert!(refused(|| contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE))));
+        // The screen is told too: a stale quote simply is not in the price list.
+        testing_env!(context(accounts(4), later).build());
+        assert!(contract.get_pool_prices(vec![sid], U128(SCALE)).is_empty());
+
+        // The venue re-stamps and the identical trade goes through.
+        testing_env!(context(accounts(0), later).build());
+        contract.set_pool_quote(sid, U128(3 * SCALE), later);
+        testing_env!(context(accounts(3), later).build());
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
+        assert!(ticket <= 1);
+
+        // A stamp in the future would be a quote that never expires.
+        testing_env!(context(accounts(0), later).build());
+        assert!(refused(|| contract
+            .set_pool_quote(sid, U128(3 * SCALE), later + MAX_QUOTE_SLACK_NS + 1_000_000_000)));
+    }
+
+    /// What the vault charges and pays is readable before the click, in the
+    /// same integers the trade will use, and only for series it will actually
+    /// trade.
+    #[test]
+    fn the_vault_publishes_the_prices_it_will_charge() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        let other = series(&mut contract);
+        assert_eq!(other, 1);
+
+        // Nothing quoted yet, so nothing for a screen to show.
+        assert!(contract.get_pool_prices(vec![sid, other], U128(SCALE)).is_empty());
+
+        quote(&mut contract, sid, 3 * SCALE);
+        let prices = contract.get_pool_prices(vec![sid, other], U128(2 * SCALE));
+        assert_eq!(prices.len(), 1, "an unquoted series is absent, not zero");
+        let p = &prices[0];
+        assert_eq!(p.series_id, sid);
+        assert_eq!(p.mid_units.0, 3 * SCALE);
+        // Two contracts at 3.00 with a 4% margin: 6.24 in, 90% of 6.00 back.
+        assert_eq!(p.entry_units.0, 6_240_000);
+        assert_eq!(p.exit_units.0, 5_400_000);
+        assert_eq!(p.age_ns, 0);
+        assert!(p.exit_units.0 < p.entry_units.0, "a round trip is never free");
+
+        // A quoted series that has since been fixed stops being offered.
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 95 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        assert!(contract.get_pool_prices(vec![sid], U128(SCALE)).is_empty());
     }
 }

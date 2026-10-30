@@ -1,5 +1,6 @@
 //! The operator's three jobs: read what the engine says the market should be,
-//! tell what the chain already has, and name the series that need a print.
+//! tell what the chain already has, and name what still needs signing — a series
+//! to list, a print to fix it, a quote for the vault to trade at.
 //!
 //! Listing and fixing are the engine's decisions (`GET /plan` and `GET /index`
 //! are arithmetic on the live index). Signing them is this host's, because the
@@ -278,6 +279,110 @@ pub fn feeds_needing_prints(due: &[Due]) -> Vec<(String, String)> {
     seen
 }
 
+/// One side of one ladder row, as the engine marked it. `mid_units` is the
+/// number the vault trades on: the contract does the fee arithmetic itself, so
+/// the host's job stops at naming the mid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotePlan {
+    pub kind: String,
+    pub low_units: u128,
+    pub high_units: u128,
+    pub mid_units: u128,
+}
+
+/// The quote a series already has on chain, from `get_pool_quote`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Standing {
+    pub mid_units: u128,
+    pub stamp_ns: u64,
+}
+
+/// Read a `get_pool_quote` reply.
+///
+/// The mid is a `U128`, which the contract's serializer writes as a *string*, and
+/// the stamp is a plain `u64`. Reading the string as a number returns nothing, so
+/// a host that does that believes no series has a quote and re-posts all of them
+/// on every tick — a still index costing a transaction per cell per tick.
+pub fn standing_quote(raw: &Value) -> Option<Standing> {
+    Some(Standing {
+        mid_units: amount(raw.get("mid_units")?)?,
+        stamp_ns: raw.get("stamp_ns").and_then(Value::as_u64)?,
+    })
+}
+
+/// Read `GET /state`: the expiry its cells were marked against, and the mids.
+///
+/// A cell the engine will not sell has no mid and is left out rather than
+/// carried as zero — the vault has no price for it, which is a different fact
+/// from a price of nothing, and `set_pool_quote` refuses the second one.
+pub fn parse_state(body: &str) -> Result<(u64, Vec<QuotePlan>), String> {
+    let value: Value = serde_json::from_str(body).map_err(|e| format!("state is not JSON: {e}"))?;
+    let expiry_ns = amount(value.get("expiryNs").ok_or("state has no expiryNs")?)
+        .ok_or("expiryNs is not an integer")?;
+    let rows = value
+        .get("chain")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "state has no chain array".to_string())?;
+    let mut plans = Vec::new();
+    for row in rows {
+        for (field, kind) in [("put", "Put"), ("call", "Call")] {
+            let Some(cell) = row.get(field) else { continue };
+            plans.push(QuotePlan {
+                kind: kind.to_string(),
+                low_units: units(cell, "low")?,
+                high_units: units(cell, "high")?,
+                mid_units: units(cell, "midUnits")?,
+            });
+        }
+    }
+    Ok((expiry_ns as u64, plans))
+}
+
+/// Which open series need a quote posted, as `(series_id, mid_units)`.
+///
+/// A quote is reposted when the price moved or when it is older than
+/// `renew_ns`, so a running index costs a transaction per move and a still one
+/// costs almost nothing — and the vault never has to reach for a price the
+/// contract would call expired. Series the engine has no rung for are left
+/// alone: their standing quote simply ages out and the vault stops trading them,
+/// which is the correct outcome when the venue has nothing to say.
+pub fn quotes_needed(
+    plans: &[QuotePlan],
+    expiry_ns: u64,
+    rows: &[(u64, Value)],
+    live: &std::collections::HashMap<u64, Standing>,
+    now_ns: u64,
+    renew_ns: u64,
+) -> Vec<(u64, u128)> {
+    let mut needed: Vec<(u64, u128)> = Vec::new();
+    for plan in plans.iter().filter(|plan| plan.mid_units > 0) {
+        let found = rows.iter().find(|(_, row)| {
+            row.get("settlement").and_then(Value::as_str) == Some("Open")
+                && row.get("expiry_ns").and_then(Value::as_u64) == Some(expiry_ns)
+                && Listed::from_view(row)
+                    .is_some_and(|listed| {
+                        listed.kind == plan.kind
+                            && listed.low_units == plan.low_units
+                            && listed.high_units == plan.high_units
+                    })
+        });
+        let Some((series_id, _)) = found else { continue };
+        if !needed.iter().any(|(id, _)| id == series_id) {
+            let repost = match live.get(series_id) {
+                None => true,
+                Some(standing) => {
+                    standing.mid_units != plan.mid_units
+                        || now_ns.saturating_sub(standing.stamp_ns) > renew_ns
+                }
+            };
+            if repost {
+                needed.push((*series_id, plan.mid_units));
+            }
+        }
+    }
+    needed
+}
+
 /// Where a URL points, for the plain-HTTP loopback reads the engine answers.
 /// No TLS here on purpose: the engine is a local process on 127.0.0.1, and a
 /// host that could reach out over the internet is a wider door than this tool
@@ -347,6 +452,7 @@ pub fn http_get(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn plan_row(low: u128, high: u128, kind: &str) -> Value {
         json!({
@@ -610,5 +716,134 @@ mod tests {
         .unwrap_err()
         .contains("not a fraction"));
         assert!(parse_print("garbage").unwrap_err().contains("not JSON"));
+    }
+
+    fn cell(low: u128, high: u128, mid: u128) -> Value {
+        json!({
+            "low": low.to_string(), "high": high.to_string(),
+            "midUnits": mid.to_string(), "openable": mid > 0,
+        })
+    }
+
+    fn state(expiry: u64, chain: &[Value]) -> String {
+        json!({ "asset": "ETH", "expiryNs": expiry.to_string(), "chain": chain }).to_string()
+    }
+
+    fn open_row(expiry: u64, low: u128, high: u128, kind: &str) -> Value {
+        json!({
+            "underlying": "ETH", "kind": kind, "settlement": "Open", "expiry_ns": expiry,
+            "low_strike": low.to_string(), "high_strike": high.to_string(),
+        })
+    }
+
+    #[test]
+    fn reads_both_sides_of_a_ladder_row() {
+        let (expiry, plans) = parse_state(&state(
+            900,
+            &[json!({ "strike": 2_400.0, "put": cell(2_300, 2_400, 55_000), "call": cell(2_400, 2_500, 71_000) })],
+        ))
+        .expect("a state");
+        assert_eq!(expiry, 900);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].kind, "Put");
+        assert_eq!(plans[0].mid_units, 55_000);
+        assert_eq!(plans[1].kind, "Call");
+        assert_eq!(plans[1].low_units, 2_400);
+    }
+
+    #[test]
+    fn a_cell_the_engine_wont_sell_is_no_quote_rather_than_a_free_one() {
+        // midUnits is "0" when a wing rounds away or a spread costs more than it
+        // can pay. Posting that would ask the contract to price the vault at
+        // nothing; leaving it out lets its last quote expire instead.
+        let (_, plans) = parse_state(&state(900, &[json!({ "put": cell(1, 2, 0) })])).unwrap();
+        assert_eq!(plans[0].mid_units, 0);
+        let rows = [(0u64, open_row(900, 1, 2, "Put"))];
+        assert!(
+            quotes_needed(&plans, 900, &rows, &HashMap::new(), 901, 30).is_empty(),
+            "a zero mid never reaches set_pool_quote"
+        );
+    }
+
+    #[test]
+    fn state_that_is_not_a_ladder_is_an_error_not_an_empty_quote_run() {
+        assert!(parse_state("garbage").unwrap_err().contains("not JSON"));
+        assert!(parse_state("{}").unwrap_err().contains("expiryNs"));
+        assert!(parse_state(&json!({"expiryNs": "9"}).to_string())
+            .unwrap_err()
+            .contains("no chain array"));
+        assert!(parse_state(&state(9, &[json!({ "put": {"low": "1"} })])).is_err(), "a half cell");
+    }
+
+    #[test]
+    fn quotes_are_posted_for_the_series_the_chain_actually_has_open() {
+        let plans = vec![
+            QuotePlan { kind: "Put".into(), low_units: 2_300, high_units: 2_400, mid_units: 55_000 },
+            QuotePlan { kind: "Call".into(), low_units: 2_400, high_units: 2_500, mid_units: 71_000 },
+        ];
+        let rows = vec![
+            (0, open_row(900, 2_300, 2_400, "Put")),
+            // Same strikes, different side: the rung is addressed by both.
+            (1, open_row(900, 2_300, 2_400, "Call")),
+            // Last week's series on the same strikes must not be re-quoted.
+            (2, open_row(800, 2_300, 2_400, "Put")),
+        ];
+        let need = quotes_needed(&plans, 900, &rows, &HashMap::new(), 901, 30);
+        assert_eq!(need, vec![(0, 55_000)], "one series, the price the engine marked");
+        // A call at 2_400/2_500 has no rung on this chain, so nothing is posted.
+        assert_eq!(need.len(), 1);
+
+        let mut settled = open_row(900, 2_300, 2_400, "Put");
+        settled["settlement"] = json!({"Fixed": {"price": 2_350}});
+        assert!(
+            quotes_needed(&plans, 900, &[(0, settled)], &HashMap::new(), 901, 30).is_empty(),
+            "a fixed series has no spread left to sell"
+        );
+    }
+
+    #[test]
+    fn a_quote_is_reposted_when_it_moves_or_goes_stale_not_every_pass() {
+        let plans = vec![QuotePlan {
+            kind: "Put".into(),
+            low_units: 2_300,
+            high_units: 2_400,
+            mid_units: 55_000,
+        }];
+        let rows = vec![(0, open_row(900, 2_300, 2_400, "Put"))];
+        let fresh = HashMap::from([(0, Standing { mid_units: 55_000, stamp_ns: 900 })]);
+        assert!(
+            quotes_needed(&plans, 900, &rows, &fresh, 910, 30).is_empty(),
+            "unchanged and young: no transaction"
+        );
+        // The price moved off the index, so the old number must be replaced.
+        let moved = quotes_needed(&plans, 900, &rows, &HashMap::from([(0, Standing {
+            mid_units: 50_000,
+            stamp_ns: 910,
+        })]), 911, 30);
+        assert_eq!(moved, vec![(0, 55_000)]);
+        // And a price that has simply aged out is refreshed before the contract
+        // would refuse it.
+        let aged = quotes_needed(&plans, 900, &rows, &fresh, 931, 30);
+        assert_eq!(aged, vec![(0, 55_000)], "31 ns past a 30 ns renew window");
+        assert!(quotes_needed(&plans, 900, &rows, &fresh, 929, 30).is_empty());
+    }
+
+    #[test]
+    fn a_standing_quote_is_read_in_the_dialect_the_contract_writes() {
+        // `U128` comes back as a string and a raw `u64` as a number. Reading the
+        // string as a number gives nothing, which the host would take for "no
+        // quote yet" and answer by re-posting every cell on every pass.
+        let live = standing_quote(&json!({
+            "mid_units": "62187841",
+            "stamp_ns": 1_793_322_190_933_147_000u64,
+        }))
+        .expect("the venue's own reply");
+        assert_eq!(live.mid_units, 62_187_841);
+        assert_eq!(live.stamp_ns, 1_793_322_190_933_147_000);
+        // An unquoted series answers null, and a reply missing either half is not
+        // an age the renewal clock can be measured against.
+        assert!(standing_quote(&Value::Null).is_none());
+        assert!(standing_quote(&json!({ "mid_units": "5" })).is_none());
+        assert!(standing_quote(&json!({ "stamp_ns": 1 })).is_none());
     }
 }

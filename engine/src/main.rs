@@ -30,6 +30,10 @@ struct Config {
     port: u16,
     assets: Vec<Asset>,
     expiry_hours: f64,
+    /// How long before the ladder's expiry the engine starts naming the next
+    /// one. The operator lists a fresh set of series on this signal, so the gap
+    /// it covers has to be longer than a listing run.
+    roll_lead_ns: u64,
     venue: Venue,
     replay: Option<PathBuf>,
     no_feed: bool,
@@ -69,6 +73,11 @@ fn parse(args: &[String]) -> Config {
         expiry_hours: flag_value(args, "--expiry-hours")
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0),
+        roll_lead_ns: flag_value(args, "--roll-lead-secs")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(600)
+            * 1_000_000_000,
         venue,
         replay: flag_value(args, "--replay").map(PathBuf::from),
         no_feed: args.iter().any(|a| a == "--no-feed"),
@@ -122,10 +131,25 @@ fn respond(stream: &mut TcpStream, body: &str, status: &str) {
 /// of numbers and the venue has one screen and one gateway pointed at it.
 fn handle(stream: &mut TcpStream, tape: &Arc<Mutex<Tape>>, config: &Config, expiry_ns: u64) {
     let Ok(mut peer) = stream.try_clone() else { return };
+    let mut reader = BufReader::new(&mut peer);
     let mut request_line = String::new();
-    if BufReader::new(&mut peer).read_line(&mut request_line).unwrap_or(0) == 0 {
+    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
         return;
     }
+    // The headers are read and thrown away. Answering while part of the request
+    // is still in the kernel's buffer turns the close into a reset, and a reset
+    // the client sees mid-read looks exactly like an engine that is not running.
+    let mut header = String::new();
+    loop {
+        header.clear();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+            break;
+        }
+        if header.trim().is_empty() {
+            break;
+        }
+    }
+    drop(reader);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
     match serve::route(&path) {
         // `expiryNs` is a JSON number on purpose: the operator reads it back to ask
@@ -225,7 +249,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let config = parse(&args);
-    let expiry_ns = now_ns() + (config.expiry_hours * 3_600_000_000_000.0) as u64;
+    let tenor_ns = (config.expiry_hours * 3_600_000_000_000.0) as u64;
+    let lead_ns = config.roll_lead_ns;
+    let mut expiry_ns = now_ns() + tenor_ns;
     let tape = Arc::new(Mutex::new(Tape::default()));
     let running = Arc::new(AtomicBool::new(true));
 
@@ -261,6 +287,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println_if(!config.quiet, &format!("listening  http://127.0.0.1:{}", config.port));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        // Rolled before it is asked for, so every route in one request agrees on
+        // the same ladder: the operator reads `/health` to learn the expiry and
+        // then asks for that expiry's plan and marks.
+        expiry_ns = serve::roll_expiry(expiry_ns, now_ns(), tenor_ns, lead_ns);
         handle(&mut stream, &tape, &config, expiry_ns);
     }
     running.store(false, Ordering::Relaxed);

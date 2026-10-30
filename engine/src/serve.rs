@@ -382,6 +382,26 @@ pub fn status_line(asset: Asset, summary: &Summary, listed: usize, feed: &str) -
     )
 }
 
+/// The expiry of the ladder to serve right now.
+///
+/// A ladder that simply ends takes the venue down with it: the chain's series
+/// expire, the operator has nothing new to list because the engine kept naming
+/// the same dead expiry, and the screen is left quoting a market that no longer
+/// exists. So the tenor rolls while there is still room for the operator to list
+/// and quote the next ladder — `lead_ns` is that room, and it is why the roll is
+/// early rather than on the deadline.
+pub fn roll_expiry(standing: u64, now_ns: u64, tenor_ns: u64, lead_ns: u64) -> u64 {
+    // A lead as long as the tenor would roll on every request, and the operator
+    // would list a new ladder forever. The warning window is a fraction of the
+    // ladder's life, never all of it.
+    let lead = lead_ns.min(tenor_ns / 2);
+    if standing.saturating_sub(now_ns) > lead {
+        standing
+    } else {
+        now_ns.saturating_add(tenor_ns)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +413,33 @@ mod tests {
 
     fn tick(source: &str, asset: &str, price: f64, ts_ms: u64) -> Tick {
         Tick { source: source.to_string(), asset: asset.to_string(), price, ts_ms }
+    }
+
+    #[test]
+    fn the_ladder_rolls_before_it_dies() {
+        let hour = 3_600_000_000_000;
+        let standing = 10 * hour;
+        // Plenty of life left: the same ladder, because a venue that changes its
+        // expiry mid-flight makes the operator list a new one for nothing.
+        assert_eq!(roll_expiry(standing, 9 * hour, hour, 10 * 60 * 1_000_000_000), standing);
+        // Inside the lead: the next tenor, measured from now, so the operator has
+        // the whole lead window to list and quote it before this one settles.
+        let lead = 10 * 60 * 1_000_000_000;
+        let rolled = roll_expiry(standing, standing - lead, hour, lead);
+        assert_eq!(rolled, standing - lead + hour, "the new tenor starts from now, not from the old expiry");
+        assert!(rolled > standing, "and it outlives the ladder it replaces");
+        // Past the deadline it still rolls, and the new ladder is a full tenor
+        // away rather than a stub.
+        assert!(roll_expiry(standing, standing + hour, hour, 60 * 1_000_000_000) > standing + hour);
+        // A lead longer than the tenor cannot make it roll on every request.
+        let tenor = 1_000_000_000;
+        let once = roll_expiry(5 * tenor, 4 * tenor, tenor, 100 * tenor);
+        assert_eq!(once, 5 * tenor, "half the tenor is the most warning a ladder gets");
+        assert_eq!(
+            roll_expiry(once, once - tenor / 2, tenor, 100 * tenor),
+            once + tenor / 2,
+            "and it rolls exactly at that point, not on every poll after"
+        );
     }
 
     #[test]
