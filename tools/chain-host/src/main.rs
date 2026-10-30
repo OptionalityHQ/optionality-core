@@ -16,6 +16,7 @@
 // The host parks when it is done. The sandbox lives and dies with this process,
 // so Ctrl-C takes the chain down with it, and re-lists on `--list-secs`.
 use anyhow::{Context, Result};
+mod activity;
 mod maker;
 mod operator;
 mod oracle;
@@ -391,6 +392,81 @@ fn complain(
     complaints.insert(key.to_string(), message);
 }
 
+/// One simulated taker, buying and closing a contract now and then.
+///
+/// The venue's numbers only move when somebody trades, and a reviewer who arrives
+/// to an empty tape reads that as "nothing works". This is one seeded account on
+/// the same public path a person uses: `pool_buy` at whatever the vault published,
+/// and `pool_close` when it wants out. It prints what it did, so the tape and the
+/// log agree.
+async fn run_activity(
+    actor: &Account,
+    options: &Contract,
+    engine: &str,
+    assets: &[String],
+    rows: &[(u64, serde_json::Value)],
+    asset_turn: usize,
+) -> Result<Option<String>> {
+    let asset = &assets[asset_turn % assets.len()];
+    let body = match operator::http_get(&format!("{engine}/state?asset={asset}")) {
+        Ok(body) => body,
+        Err(_) => return Ok(None),
+    };
+    let (expiry_ns, plans) =
+        operator::parse_state(&body).map_err(|error| anyhow::anyhow!("{asset} ladder: {error}"))?;
+    let Some(index_units) = operator::parse_spot(&body) else { return Ok(None) };
+
+    // Every other pass, take one back instead of buying: a tape where every print
+    // is a buy is a tape nobody believes.
+    if asset_turn % 2 == 1 {
+        let held: Vec<serde_json::Value> = actor
+            .view(options.id(), "get_positions")
+            .args_json(json!({ "account": actor.id(), "limit": 50 }))
+            .await?
+            .json()?;
+        let pool_ticket = held.iter().rev().find(|row| {
+            row.get("settlement").and_then(serde_json::Value::as_str) == Some("Open")
+                && row.get("side").and_then(serde_json::Value::as_str) == Some("long")
+        });
+        if let Some(row) = pool_ticket {
+            let ticket_id = row.get("ticket_id").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let label = row.get("series").and_then(serde_json::Value::as_str).unwrap_or("a ticket");
+            actor
+                .call(options.id(), "pool_close")
+                .args_json(json!({ "ticket_id": ticket_id, "min_exit_units": null }))
+                .gas(GAS)
+                .transact()
+                .await?
+                .into_result()?;
+            return Ok(Some(format!("closed {label}")));
+        }
+    }
+
+    let Some(play) = activity::pick(index_units, &plans, rows, expiry_ns) else { return Ok(None) };
+    let label = rows
+        .iter()
+        .find(|(id, _)| *id == play.series_id)
+        .map(|(_, row)| {
+            let kind = row.get("kind").and_then(serde_json::Value::as_str).unwrap_or("?");
+            let low = row.get("low_strike").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let high = row.get("high_strike").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            format!("{} {:.0}/{:.0}", kind, low as f64 / SCALE as f64, high as f64 / SCALE as f64)
+        })
+        .unwrap_or_else(|| format!("series {}", play.series_id));
+    actor
+        .call(options.id(), "pool_buy")
+        .args_json(json!({
+            "series_id": play.series_id,
+            "quantity": SCALE.to_string(),
+            "max_total_premium": play.budget_units.to_string(),
+        }))
+        .gas(GAS)
+        .transact()
+        .await?
+        .into_result()?;
+    Ok(Some(format!("bought 1 {label}")))
+}
+
 /// Ask the contract to fix every series whose expiry has passed and whose
 /// acceptance window has not. The committee has to be talking already — a fix is
 /// made of prices the oracle holds, not of prices requested here.
@@ -637,6 +713,9 @@ async fn main() -> Result<()> {
     // A seeded maker is a demo convenience, not a business: it is a real account
     // with real escrowed collateral, and it can lose money like anyone else.
     let maker_role = optional("--maker");
+    // One seeded taker on the same public path a person uses, so the tape and the
+    // charts move while somebody is looking at them.
+    let activity_role = optional("--activity");
     let maker_secs: u64 = arg("--maker-secs", "20").parse().context("--maker-secs must be seconds")?;
     let assets_list = assets();
     let mut listed = (0usize, 0usize);
@@ -816,6 +895,15 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| panic!("--maker names a role this host does not fund: {role}"))
         });
         let mut last_maker = std::time::Instant::now() - std::time::Duration::from_secs(maker_secs);
+        let activity_account = activity_role.as_ref().map(|role| {
+            roles
+                .iter()
+                .find(|(name, _)| name == role)
+                .map(|(_, account)| account.clone())
+                .unwrap_or_else(|| panic!("--activity names a role this host does not fund: {role}"))
+        });
+        let mut activity_turn = 0usize;
+        let mut last_activity = std::time::Instant::now();
         let mut rows = chain_series(&options).await?;
         let mut last_rows = std::time::Instant::now();
         loop {
@@ -888,6 +976,17 @@ async fn main() -> Result<()> {
                         Ok(0) => {}
                         Ok(acted) => println!("maker quoted {acted} order(s)"),
                         Err(error) => println!("maker failed, chain still live: {error}"),
+                    }
+                }
+            }
+            if let Some(actor) = &activity_account {
+                if last_activity.elapsed().as_secs() >= 18 {
+                    last_activity = std::time::Instant::now();
+                    activity_turn += 1;
+                    match run_activity(actor, &options, url, &assets_list, &rows, activity_turn).await {
+                        Ok(Some(done)) => println!("activity: {done}"),
+                        Ok(None) => {}
+                        Err(error) => println!("activity failed, chain still live: {error}"),
                     }
                 }
             }

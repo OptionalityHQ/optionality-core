@@ -22,6 +22,8 @@ HOURS=${HOURS:-0}
 TICK_SECS=${TICK_SECS:-4}
 LIST_SECS=${LIST_SECS:-30}
 MAKER_ROLE=${MAKER_ROLE:-maker-1}
+# One seeded taker, so the tape moves without a visitor having to click.
+ACTIVITY_ROLE=${ACTIVITY_ROLE:-taker-1}
 SESSION=${SESSION:-data/chain-session.json}
 LOGS=logs
 
@@ -67,7 +69,7 @@ sleep 2
 
 nohup ./target/debug/chain-host --out "$SESSION" \
   --engine "http://127.0.0.1:$ENGINE_PORT" --assets "$ASSETS" \
-  --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" --maker "$MAKER_ROLE" > "$LOGS/host.log" 2>&1 &
+  --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" --maker "$MAKER_ROLE" --activity "$ACTIVITY_ROLE" > "$LOGS/host.log" 2>&1 &
 
 echo "booting the sandbox and listing the engine's ladder (watch $LOGS/host.log)…"
 # The gate is the session file being *written*, not the ladder being listed: the
