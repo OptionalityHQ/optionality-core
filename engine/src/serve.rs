@@ -410,11 +410,29 @@ pub fn upcoming(expiries: &[u64], now_ns: u64) -> Vec<u64> {
 /// close at 08:00 UTC out to a week. Five of the seven land inside three days,
 /// which is where a spread actually trades; the last two are there so the strip
 /// reads like a venue rather than like a single market.
-pub fn schedule(now_ns: u64, near_ns: u64) -> Vec<u64> {
+/// The ladders the venue lists: the near tenor, `hours` whole-hour markets, a
+/// half-day, and a daily close out to a week.
+///
+/// `hours` is a knob rather than a constant because every extra ladder is another
+/// quote the operator has to renew inside the contract's sixty seconds, and a
+/// sandbox clock that runs faster than the wall clock turns that sixty seconds into
+/// about twenty. Zero is a perfectly good schedule; two is a better demo.
+pub fn schedule(now_ns: u64, near_ns: u64, hours: u64) -> Vec<u64> {
     const HOUR: u64 = 3_600_000_000_000;
     const DAY: u64 = 24 * HOUR;
     let near = near_ns.max(HOUR / 60);
     let mut expiries = vec![now_ns + near, now_ns + near.max(12 * HOUR)];
+    // The whole hours. A trader watching an intraday market wants the next few
+    // hours on the strip, not one tenor and then a week. These sit in front of the
+    // daily closes and behind the near tenor, which is the ladder the screen opens
+    // on.
+    let next_hour = (now_ns / HOUR + 1) * HOUR;
+    for step in 0..hours {
+        let expiry = next_hour + step * HOUR;
+        if expiry > now_ns + near {
+            expiries.push(expiry);
+        }
+    }
     // The daily close: 08:00 UTC, the hour a listed option expires.
     let close = (now_ns / DAY) * DAY + 8 * HOUR;
     for day in [1u64, 2, 3, 5, 7] {
@@ -454,10 +472,32 @@ mod tests {
     }
 
     #[test]
+    fn the_intraday_grid_sits_in_front_of_the_daily_closes() {
+        let hour = 3_600_000_000_000u64;
+        let day = 24 * hour;
+        let now = 1_793_280_000 * 1_000_000_000; // 08:00 UTC
+        let expiries = schedule(now, 30 * 60 * 1_000_000_000, 2);
+        assert_eq!(expiries[0], now + hour / 2, "the tenor asked for comes first");
+        let hours: Vec<u64> = expiries.iter().copied().filter(|ns| ns % hour == 0).take(2).collect();
+        assert_eq!(hours.len(), 2, "two whole hours behind it: {expiries:?}");
+        assert!(hours.windows(2).all(|pair| pair[1] - pair[0] == hour), "consecutive");
+        assert!(hours[0] > now + hour / 2, "and all of them after the near tenor");
+        let closes = expiries.iter().filter(|ns| **ns % day == 8 * hour).count();
+        assert_eq!(closes, 5, "five 08:00 closes are still listed behind them");
+        assert!(expiries.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // An hour is added even when the near tenor already lands on it: two ways
+        // to reach the same instant is one ladder, not two.
+        let on_the_hour = schedule(now, hour, 2);
+        assert_eq!(on_the_hour.iter().filter(|ns| **ns == now + hour).count(), 1);
+        assert_eq!(on_the_hour[0], now + hour, "and the near tenor is that ladder");
+    }
+
+    #[test]
     fn the_venue_lists_a_week_with_most_of_it_inside_three_days() {
         let hour = 3_600_000_000_000u64;
         let now = 1_793_280_000 * 1_000_000_000; // 08:00 UTC, the daily close
-        let expiries = schedule(now, 4 * hour);
+        let expiries = schedule(now, 4 * hour, 2);
         assert_eq!(expiries.len(), 7, "{expiries:?}");
         assert!(expiries.windows(2).all(|pair| pair[0] < pair[1]), "sorted and distinct");
         assert_eq!(expiries[0], now + 4 * hour, "the near tenor is the one asked for");
@@ -468,15 +508,22 @@ mod tests {
         let furthest = *expiries.last().unwrap();
         assert!(furthest >= now + 6 * 24 * hour, "and it reaches into next week");
 
-        // A near tenor shorter than the intraday step keeps its own slot: the
-        // settle demo runs a three-minute expiry, not a day.
-        let short = schedule(now, 3 * 60 * 1_000_000_000);
+        // A near tenor shorter than an hour keeps its own slot and the whole hours
+        // follow it: the settle demo runs a three-minute expiry, not a day, and a
+        // trader who wants the next few hours gets them.
+        let short = schedule(now, 3 * 60 * 1_000_000_000, 2);
         assert_eq!(short[0], now + 3 * 60 * 1_000_000_000);
-        assert_eq!(short[1], now + 12 * hour, "the next slot stays intraday");
+        let hours: Vec<u64> = short.iter().copied().filter(|ns| ns % hour == 0).take(2).collect();
+        assert_eq!(hours.len(), 2, "two whole hours on the strip: {short:?}");
+        assert!(
+            hours.windows(2).all(|pair| pair[1] - pair[0] == hour),
+            "and they are the next two, not scattered: {hours:?}"
+        );
+        assert!(short.contains(&(now + 12 * hour)), "and the half-day tenor is still there");
 
         // A minute is the floor: nothing is listed with an expiry already gone
         // by the time the operator reads it.
-        assert!(schedule(now, 0)[0] > now);
+        assert!(schedule(now, 0, 2)[0] > now);
     }
 
     #[test]

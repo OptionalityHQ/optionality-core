@@ -16,15 +16,19 @@ ENGINE_PORT=${ENGINE_PORT:-8791}
 GATEWAY_PORT=${GATEWAY_PORT:-8790}
 ASSETS=${ASSETS:-ETH,BTC}
 EXPIRY_HOURS=${EXPIRY_HOURS:-1}
+# Whole-hour markets in front of the daily closes. One is the default strip;
+# HOURS=2 is a better demo and a heavier quote cycle.
+HOURS=${HOURS:-0}
 TICK_SECS=${TICK_SECS:-4}
 LIST_SECS=${LIST_SECS:-30}
+MAKER_ROLE=${MAKER_ROLE:-maker-1}
 SESSION=${SESSION:-data/chain-session.json}
 LOGS=logs
 
 busy_on() { lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -3; }
 
 stop_all() {
-  for pattern in "target/debug/chain-host" "target/debug/engine" "api/src/server.ts"; do
+  for pattern in "target/debug/chain-host" "target/debug/engine" "target/debug/oracle-signer" "api/src/server.ts"; do
     local pids
     pids=$(pgrep -f "$pattern" || true)
     if [ -n "$pids" ]; then
@@ -52,18 +56,18 @@ done
 
 mkdir -p "$LOGS" data
 ./scripts/build.sh
-cargo build -q -p engine -p chain-host
+cargo build -q -p engine -p chain-host -p oracle-signer
 # The page the gateway serves is the template's output, so building the venue
 # without rebuilding the page would serve yesterday's screen from today's chain.
 node sim/build-demo.mjs
 
 nohup ./target/debug/engine --port "$ENGINE_PORT" --assets "$ASSETS" \
-  --expiry-hours "$EXPIRY_HOURS" > "$LOGS/engine.log" 2>&1 &
+  --expiry-hours "$EXPIRY_HOURS" --hours "$HOURS" > "$LOGS/engine.log" 2>&1 &
 sleep 2
 
 nohup ./target/debug/chain-host --out "$SESSION" \
   --engine "http://127.0.0.1:$ENGINE_PORT" --assets "$ASSETS" \
-  --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" > "$LOGS/host.log" 2>&1 &
+  --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" --maker "$MAKER_ROLE" > "$LOGS/host.log" 2>&1 &
 
 echo "booting the sandbox and listing the engine's ladder (watch $LOGS/host.log)…"
 # The gate is the session file being *written*, not the ladder being listed: the

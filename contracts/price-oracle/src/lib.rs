@@ -388,9 +388,11 @@ impl Contract {
         for source in &active {
             let stored = self.latest.get(&key_for(&feed_id, &source.name)).cloned();
             let age_ns = stored.as_ref().map(|s| now.saturating_sub(s.seen_at_ns)).unwrap_or(0);
-            let fresh = stored
-                .as_ref()
-                .is_some_and(|s| age_ns <= self.max_age_ns && s.observation.publish_time_ns <= now);
+            let fresh = stored.as_ref().is_some_and(|s| {
+                age_ns <= self.max_age_ns
+                    && s.observation.publish_time_ns <= now
+                    && now.saturating_sub(s.observation.publish_time_ns) <= self.max_age_ns
+            });
             if let (true, Some(stored)) = (fresh, stored.as_ref()) {
                 candidates.push((
                     stored.observation.price,
@@ -448,10 +450,17 @@ impl Contract {
         let mut candidates: Vec<(u128, String, u64)> = Vec::new();
         for source in self.sources.iter().filter(|s| s.removed_ns == 0) {
             let Some(stored) = self.latest.get(&key_for(feed_id, &source.name)) else { continue };
+            // Freshness has two halves. How recently the relay delivered the price
+            // is one; how recently the price was *published* is the other, and it
+            // is the one that matters — a source whose feed stopped moving would
+            // otherwise keep signing its last number and keep voting for ever.
             if now_ns.saturating_sub(stored.seen_at_ns) > self.max_age_ns {
                 continue;
             }
             if stored.observation.publish_time_ns > now_ns {
+                continue;
+            }
+            if now_ns.saturating_sub(stored.observation.publish_time_ns) > self.max_age_ns {
                 continue;
             }
             candidates.push((
@@ -669,6 +678,29 @@ mod tests {
         let view = contract.get_committee(BTC.to_string());
         assert_eq!(view.fresh_sources, 1);
         assert_eq!(view.seats.iter().filter(|seat| seat.fresh).count(), 1);
+    }
+
+    #[test]
+    fn a_price_that_stopped_moving_loses_its_vote() {
+        // A source whose feed stalled re-signs a slightly later stamp to keep its
+        // seat warm. The relay sees a price delivered seconds ago; the market saw a
+        // number minutes old, and a stale number is not a settlement price.
+        let (mut contract, seats) = committee(3);
+        assert_eq!(contract.submit_observations(pair(&seats, ATM, NOW - 1)).fixed.len(), 1);
+        let later = NOW + 200_000_000_000;
+        testing_env!(at(accounts(1), later).build());
+        let result = contract.submit_observations(vec![signed(
+            &seats[0].1,
+            &seats[0].0,
+            ATM,
+            // Newer than what this seat said before, so the replay rule accepts it…
+            NOW + 1_000_000_000,
+        )]);
+        assert_eq!(result.accepted, 1, "…and the oracle still stores it");
+        let view = contract.get_committee(BTC.to_string());
+        let seat = view.seats.iter().find(|seat| seat.source == seats[0].0).expect("seated");
+        assert!(!seat.fresh, "but a 199 second old print is not a fresh vote: {seat:?}");
+        assert!(!view.can_fix, "and one fresh seat is not a quorum");
     }
 
     #[test]

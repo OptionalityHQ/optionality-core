@@ -8,6 +8,7 @@ members = [
     "surface",
     "integration-tests",
     "tools/chain-host",
+    "tools/oracle-signer",
 ]
 resolver = "2"
 

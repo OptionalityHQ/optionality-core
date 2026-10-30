@@ -1,0 +1,13 @@
+[package]
+name = "oracle-signer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# One key, one process, no network: this binary's whole job is to answer "sign
+# this" for the seat it owns and nothing else.
+[dependencies]
+bounded-core = { path = "../../core" }
+ed25519-dalek = "2.2.0"
+hex = "0.4"

@@ -33,6 +33,10 @@ struct Config {
     /// schedule, so a three-minute tenor is a demo knob and a four-hour one is
     /// the day it ships with.
     expiry_hours: f64,
+    /// Whole-hour markets in front of the daily closes. Each one is another quote
+    /// to renew inside the contract's sixty seconds, so it is a knob: zero is a
+    /// clean schedule, one or two is a nicer strip.
+    hours: u64,
     venue: Venue,
     replay: Option<PathBuf>,
     no_feed: bool,
@@ -73,6 +77,10 @@ fn parse(args: &[String]) -> Config {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|hours| *hours > 0.0)
             .unwrap_or(4.0),
+        hours: flag_value(args, "--hours")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|hours| *hours <= 4)
+            .unwrap_or(0),
         venue,
         replay: flag_value(args, "--replay").map(PathBuf::from),
         no_feed: args.iter().any(|a| a == "--no-feed"),
@@ -254,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = parse(&args);
     let near_ns = (config.expiry_hours * 3_600_000_000_000.0) as u64;
-    let expiries = serve::schedule(now_ns(), near_ns);
+    let expiries = serve::schedule(now_ns(), near_ns, config.hours);
     let tape = Arc::new(Mutex::new(Tape::default()));
     let running = Arc::new(AtomicBool::new(true));
 

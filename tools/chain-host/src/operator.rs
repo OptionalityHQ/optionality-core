@@ -237,7 +237,7 @@ pub fn quote_age(expiry_ns: u64, now_ns: u64) -> u64 {
 }
 
 /// Which ladders a pass should quote, soonest-overdue first and capped, so a pass
-/// stays finite while no ladder is left past half its quote life. Renewing at half
+/// stays finite while no ladder is left past its renewal point. Renewing at half
 /// the age limit is the slack that keeps a slow pass — or a transaction still in
 /// flight — from landing a quote past its own expiry.
 pub fn ladders_due(
@@ -248,7 +248,10 @@ pub fn ladders_due(
 ) -> Vec<u64> {
     let mut scored: Vec<(u64, u64)> = Vec::new();
     for expiry_ns in expiries {
-        let renew_ns = quote_age(*expiry_ns, now_ns) / 2;
+        // Renew at a third of the limit, not half. The sandbox clock runs faster
+        // than the wall clock, so sixty seconds of chain time is nearer twenty of
+        // ours — half a limit is no slack at all there.
+        let renew_ns = quote_age(*expiry_ns, now_ns) / 3;
         let overdue = match last_quoted.get(expiry_ns) {
             None => u64::MAX,
             Some(&at) => now_ns.saturating_sub(at).saturating_sub(renew_ns),
@@ -340,6 +343,20 @@ pub fn parse_state(body: &str) -> Result<(u64, Vec<QuotePlan>), String> {
         }
     }
     Ok((expiry_ns as u64, plans))
+}
+
+/// The index the engine marked a ladder with, in the same units as the strikes.
+///
+/// The maker needs it to know which strike is "nearest the money"; it is the same
+/// number the screen shows, so the cells a person sees at the top of the ladder
+/// are the cells a person's offers land on.
+pub fn parse_spot(body: &str) -> Option<u128> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let spot = value.get("spot").and_then(Value::as_f64)?;
+    if !spot.is_finite() || spot <= 0.0 {
+        return None;
+    }
+    Some((spot * 1_000_000.0).round() as u128)
 }
 
 /// Series whose accept window closed while still Open.
@@ -688,6 +705,14 @@ mod tests {
         let fresh: std::collections::HashMap<u64, u64> =
             [(a, now), (b, now), (c, now)].into_iter().collect();
         assert!(ladders_due(&[a, b, c], now, &fresh, 4).is_empty(), "nothing renewed this pass");
+    }
+
+    #[test]
+    fn the_index_comes_back_in_the_units_the_strikes_use() {
+        let body = json!({ "spot": 2360.42, "expiryNs": "1", "chain": [] });
+        assert_eq!(parse_spot(&body.to_string()), Some(2_360_420_000));
+        assert_eq!(parse_spot(&json!({ "spot": null }).to_string()), None);
+        assert_eq!(parse_spot("not json"), None);
     }
 
     #[test]

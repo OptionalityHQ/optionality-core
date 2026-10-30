@@ -16,13 +16,14 @@
 // The host parks when it is done. The sandbox lives and dies with this process,
 // so Ctrl-C takes the chain down with it, and re-lists on `--list-secs`.
 use anyhow::{Context, Result};
+mod maker;
 mod operator;
 mod oracle;
 
 use near_workspaces::types::{Gas, NearToken};
 use near_workspaces::{Account, Contract};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 const SCALE: u128 = 1_000_000;
@@ -37,6 +38,9 @@ const GAS: Gas = Gas::from_tgas(80);
 /// that a seat is never stale when a series comes due, slow enough that nobody
 /// outside this machine is being polled to death.
 const ORACLE_SECS: u64 = 8;
+/// How long a registry read is good for. Long enough to keep a pass short, short
+/// enough that a series that just settled is not treated as open for a minute.
+const ROWS_TTL_SECS: u64 = 12;
 const ROLES: [&str; 10] = [
     "you", "lp", "maker-1", "maker-2", "maker-3", "bidder-1", "bidder-2", "taker-1", "taker-2",
     "taker-3",
@@ -204,6 +208,93 @@ async fn list_ladder(
     Ok((created, planned))
 }
 
+/// Keep a person's offers resting on the cells nearest the money.
+///
+/// The vault is the counterparty to every click, which makes a book optional and
+/// therefore empty. These are real offers from a real account with its own
+/// escrowed collateral — a seeded maker, not organic flow, and one that can lose
+/// money exactly like any other seller.
+async fn run_maker(
+    maker: &Account,
+    options: &Contract,
+    engine: &str,
+    assets: &[String],
+    rows: &[(u64, serde_json::Value)],
+) -> Result<usize> {
+    let mut acted = 0usize;
+    for asset in assets {
+        let body = match operator::http_get(&format!("{engine}/state?asset={asset}")) {
+            Ok(body) => body,
+            Err(error) => {
+                println!("maker cannot read the {asset} ladder: {error}");
+                continue;
+            }
+        };
+        let (expiry_ns, plans) =
+            operator::parse_state(&body).map_err(|error| anyhow::anyhow!("{asset} ladder: {error}"))?;
+        let Some(index_units) = operator::parse_spot(&body) else { continue };
+        let wants = maker::wants(index_units, &plans, rows, expiry_ns);
+        if wants.is_empty() {
+            continue;
+        }
+        let mut mine: Vec<(u64, u64, u128)> = Vec::new();
+        for want in &wants {
+            let book: serde_json::Value = options
+                .view("get_book")
+                .args_json(json!({ "series_id": want.series_id, "limit": 50 }))
+                .await?
+                .json()?;
+            for level in book.as_array().map(|rows| rows.as_slice()).unwrap_or_default() {
+                if level.get("maker").and_then(serde_json::Value::as_str) != Some(maker.id().as_str()) {
+                    continue;
+                }
+                let offer_id = level.get("offer_id").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let premium: u128 = level
+                    .get("premium")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                mine.push((offer_id, want.series_id, premium));
+            }
+        }
+        // A demo maker reprices when the model has genuinely moved, not on every
+        // tick: twenty basis points of drift is noise, and a cancel plus a post
+        // every pass is two transactions of churn on somebody else's book.
+        for action in maker::plan(&mine, &wants, 200) {
+            match action {
+                maker::Action::Cancel { offer_id } => {
+                    maker
+                        .call(options.id(), "cancel_offer")
+                        .args_json(json!({ "offer_id": offer_id }))
+                        .gas(GAS)
+                        .transact()
+                        .await?
+                        .into_result()?;
+                    acted += 1;
+                }
+                maker::Action::Post { series_id, premium_units } => {
+                    let expires_ns = expiry_ns.saturating_sub(1_000_000_000);
+                    maker
+                        .call(options.id(), "post_offer")
+                        .args_json(json!({
+                            "series_id": series_id,
+                            "quantity": (SCALE).to_string(),
+                            "premium": premium_units.to_string(),
+                            "taker": null,
+                            "expires_ns": expires_ns,
+                        }))
+                        .gas(GAS)
+                        .transact()
+                        .await?
+                        .into_result()?;
+                    acted += 1;
+                }
+            }
+        }
+    }
+    Ok(acted)
+}
+
 /// Put every seat's price on chain.
 ///
 /// The host asks each source its own question — the venue's index, Kraken's book,
@@ -226,6 +317,7 @@ async fn feed_committee(
     seats: &[oracle::Seat],
     engine: &str,
     last_print_ns: &mut std::collections::HashMap<String, u64>,
+    complaints: &mut std::collections::HashMap<String, String>,
     waited: &mut [u64],
     tick_secs: u64,
 ) -> Result<usize> {
@@ -237,26 +329,33 @@ async fn feed_committee(
         }
         waited[index] = 0;
         for feed in &oracle::FEEDS {
+            let key = format!("{}|{}", seat.name, feed.id);
             let tick = match oracle::fetch(seat.name, feed, engine) {
                 Ok(tick) => tick,
                 // One silent source costs the committee a vote, not a settlement:
-                // a quorum of the others still fixes.
+                // a quorum of the others still fixes. Said once per distinct
+                // problem, because a feed that is down is down every pass.
                 Err(error) => {
-                    println!("{} says nothing about {}: {error}", seat.name, feed.id);
+                    complain(complaints, &key, format!("{} says nothing about {}: {error}", seat.name, feed.id));
                     continue;
                 }
             };
-            if seat.name == "venue-index"
-                && last_print_ns
-                    .get(feed.id)
-                    .is_some_and(|last| tick.publish_time_ns <= *last)
-            {
-                // The index has not moved. Waiting one more pass is right; making
-                // the oracle refuse a replay is noise.
+            if last_print_ns.get(&key).is_some_and(|last| tick.publish_time_ns <= *last) {
+                // The same print again, or an older one. The oracle would refuse
+                // it, and repeating it every eight seconds is noise.
                 continue;
             }
-            last_print_ns.insert(feed.id.to_string(), tick.publish_time_ns);
-            batch.push(seat.observation(feed.id, &tick));
+            match seat.observation(feed.id, &tick) {
+                Ok(item) => {
+                    last_print_ns.insert(key, tick.publish_time_ns);
+                    batch.push(item);
+                }
+                // A signer that will not sign costs the committee one vote for one
+                // feed; the rest of the batch still goes.
+                Err(error) => {
+                    complain(complaints, &key, format!("{} could not sign {}: {error}", seat.name, feed.id))
+                }
+            }
         }
     }
     if batch.is_empty() {
@@ -275,6 +374,23 @@ async fn feed_committee(
         println!("oracle refused a price: {}", rejected.as_str().unwrap_or("?"));
     }
     Ok(accepted)
+}
+
+/// Say a thing once, then stay quiet until it changes.
+///
+/// These loops run every few seconds for as long as the venue is up; a feed that
+/// is down or a signer that refuses would otherwise fill the log with the same
+/// sentence until nobody reads it.
+fn complain(
+    complaints: &mut std::collections::HashMap<String, String>,
+    key: &str,
+    message: String,
+) {
+    if complaints.get(key) == Some(&message) {
+        return;
+    }
+    println!("{message}");
+    complaints.insert(key.to_string(), message);
 }
 
 /// Ask the contract to fix every series whose expiry has passed and whose
@@ -444,10 +560,12 @@ async fn main() -> Result<()> {
         .transact()
         .await?
         .into_result()?;
-    // Seat the committee before anything can trade. The host holds these keys for
-    // as long as the sandbox lives and never writes them down; the oracle only
-    // accepts a price signed by the seat it belongs to.
-    let seats = oracle::committee();
+    // Seat the committee before anything can trade. Each seat's key is generated
+    // inside the signer process that owns it — the relay that fetches prices can
+    // ask for a signature and cannot make one, and venue.sh stops those
+    // processes with the rest.
+    let (seats, signers) = oracle::start_committee(Path::new("data/oracle"))
+        .map_err(|error| anyhow::anyhow!("starting the committee: {error}"))?;
     for seat in &seats {
         admin
             .call(oracle.id(), "add_source")
@@ -464,7 +582,7 @@ async fn main() -> Result<()> {
         .transact()
         .await?
         .into_result()?;
-    println!("seated {} sources, quorum 2", seats.len());
+    println!("seated {} sources in {} signer processes, quorum 2", seats.len(), signers.len());
     options
         .call("new")
         .args_json(json!({ "admin": admin.id(), "token": token.id(), "oracle": oracle.id() }))
@@ -513,6 +631,10 @@ async fn main() -> Result<()> {
 
     let engine = optional("--engine");
     let list_secs: u64 = arg("--list-secs", "300").parse().context("--list-secs must be seconds")?;
+    // A seeded maker is a demo convenience, not a business: it is a real account
+    // with real escrowed collateral, and it can lose money like anyone else.
+    let maker_role = optional("--maker");
+    let maker_secs: u64 = arg("--maker-secs", "20").parse().context("--maker-secs must be seconds")?;
     let assets_list = assets();
     let mut listed = (0usize, 0usize);
     if let Some(url) = &engine {
@@ -556,7 +678,7 @@ async fn main() -> Result<()> {
                     expiry_ns,
                     &live,
                     now_ns,
-                    operator::quote_age(expiry_ns, now_ns) / 2,
+                    operator::quote_age(expiry_ns, now_ns) / 3,
                 )
                 .await {
                     Ok((posted, priced)) => println!("quoted {posted} of {priced} priced cells at {}", stamp(expiry_ns)),
@@ -604,8 +726,11 @@ async fn main() -> Result<()> {
     // comes due minutes from now should not depend on this loop ever having run.
     if let Some(url) = &engine {
         let mut printed = std::collections::HashMap::new();
+        let mut complaints = std::collections::HashMap::new();
         let mut ready = vec![1_000u64; seats.len()];
-        match feed_committee(&admin, &oracle, &seats, url, &mut printed, &mut ready, 1).await {
+        match feed_committee(&admin, &oracle, &seats, url, &mut printed, &mut complaints, &mut ready, 1)
+            .await
+        {
             Ok(accepted) => println!("committee opened with {accepted} signed prices"),
             Err(error) => println!("committee feed failed to start, chain still live: {error}"),
         }
@@ -617,6 +742,7 @@ async fn main() -> Result<()> {
             (admin.clone(), oracle.clone(), seats.clone(), url.clone());
         tokio::spawn(async move {
             let mut printed = std::collections::HashMap::new();
+            let mut complaints = std::collections::HashMap::new();
             let mut waited = vec![0u64; seats.len()];
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(ORACLE_SECS)).await;
@@ -626,6 +752,7 @@ async fn main() -> Result<()> {
                     &seats,
                     &engine_url,
                     &mut printed,
+                    &mut complaints,
                     &mut waited,
                     ORACLE_SECS,
                 )
@@ -674,18 +801,41 @@ async fn main() -> Result<()> {
     if let Some(url) = &engine {
         let tick_secs: u64 = arg("--tick-secs", "5").parse().context("--tick-secs must be seconds")?;
         let assets_list = assets();
-        let mut since_list = list_secs;
+        // Cadences are measured on a real clock, not by counting `--tick-secs`:
+        // a pass that reads the registry back takes as long as it takes, and a
+        // counter that assumes four seconds made every interval a lie — the maker
+        // fired every two minutes and the listing every ten.
+        let mut last_list = std::time::Instant::now() - std::time::Duration::from_secs(list_secs);
         let mut last_quoted: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let maker_account = maker_role.as_ref().map(|role| {
+            roles
+                .iter()
+                .find(|(name, _)| name == role)
+                .map(|(_, account)| account.clone())
+                .unwrap_or_else(|| panic!("--maker names a role this host does not fund: {role}"))
+        });
+        let mut last_maker = std::time::Instant::now() - std::time::Duration::from_secs(maker_secs);
+        let mut rows = chain_series(&options).await?;
+        let mut last_rows = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(tick_secs)).await;
-            since_list += tick_secs;
-            let rows = match chain_series(&options).await {
-                Ok(rows) => rows,
-                Err(error) => {
-                    println!("read failed, chain still live: {error}");
-                    continue;
+            // The registry is read on the listing cadence, not on every pass:
+            // sixty series come back in a handful of batched calls, but the pass
+            // has to be quicker than the contract's quote age or the ladder goes
+            // stale between renewals. A row read seconds ago is the same row.
+            let listing_due = last_rows.elapsed().as_secs() >= ROWS_TTL_SECS;
+            if listing_due {
+                match chain_series(&options).await {
+                    Ok(fresh) => {
+                        rows = fresh;
+                        last_rows = std::time::Instant::now();
+                    }
+                    Err(error) => {
+                        println!("read failed, chain still live: {error}");
+                        continue;
+                    }
                 }
-            };
+            }
             let expiries = match engine_expiries(url).await {
                 Ok(list) => list,
                 Err(error) => {
@@ -693,8 +843,10 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
-            if since_list >= list_secs || !ladder_is_listed(&rows, &expiries) {
-                since_list = 0;
+            if last_list.elapsed().as_secs() >= list_secs || !ladder_is_listed(&rows, &expiries) {
+                last_list = std::time::Instant::now();
+                rows = chain_series(&options).await?;
+                last_rows = std::time::Instant::now();
                 match list_ladder(&admin, &options, url, &assets_list, &rows, &expiries, 200).await {
                     Ok((created, planned)) if created > 0 => println!("listed {created} of {planned} series"),
                     Ok((_, planned)) => println!("ladder unchanged · {planned} series planned"),
@@ -708,8 +860,8 @@ async fn main() -> Result<()> {
             // left the near ones — the ones a trader can actually click — past the
             // contract's quote age between visits, which the screen then reports as
             // a vault that will not sell.
-            for expiry_ns in operator::ladders_due(&expiries, now_ns, &last_quoted, 4) {
-                let renew_ns = operator::quote_age(expiry_ns, now_ns) / 2;
+            for expiry_ns in operator::ladders_due(&expiries, now_ns, &last_quoted, 8) {
+                let renew_ns = operator::quote_age(expiry_ns, now_ns) / 3;
                 last_quoted.insert(expiry_ns, now_ns);
                 match read_standing(&options, &rows, expiry_ns).await {
                     Ok(live) => match quote_ladder(
@@ -726,6 +878,16 @@ async fn main() -> Result<()> {
                         Err(error) => println!("quoting failed, chain still live: {error}"),
                     },
                     Err(error) => println!("quote read failed, chain still live: {error}"),
+                }
+            }
+            if let Some(maker) = &maker_account {
+                if last_maker.elapsed().as_secs() >= maker_secs {
+                    last_maker = std::time::Instant::now();
+                    match run_maker(maker, &options, url, &assets_list, &rows).await {
+                        Ok(0) => {}
+                        Ok(acted) => println!("maker quoted {acted} order(s)"),
+                        Err(error) => println!("maker failed, chain still live: {error}"),
+                    }
                 }
             }
             match request_fixes(&admin, &options, &rows, now_ns).await {

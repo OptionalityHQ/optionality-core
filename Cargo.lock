@@ -331,6 +331,7 @@ dependencies = [
  "anyhow",
  "bounded-core",
  "ed25519-dalek",
+ "hex",
  "near-workspaces",
  "serde_json",
  "tokio",
@@ -2543,6 +2544,15 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "oracle-signer"
+version = "0.1.0"
+dependencies = [
+ "bounded-core",
+ "ed25519-dalek",
+ "hex",
 ]
 
 [[package]]
