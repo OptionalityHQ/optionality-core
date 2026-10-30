@@ -208,8 +208,12 @@ fn handle(stream: &mut TcpStream, tape: &Arc<Mutex<Tape>>, config: &Config, expi
                     scale,
                 )
             };
-            let quotable = body.contains("\"quotable\":true");
-            respond(stream, &body, if quotable { "200 OK" } else { "503 Service Unavailable" });
+            // Answered with its own verdict in the body rather than as a status
+            // code: a degraded index is still an index, the print says how much
+            // it is worth, and the caller that needs a live one reads `quotable`.
+            // A 503 here made one stale socket look like a transport failure, and
+            // the operator dropped a whole settlement pass on it.
+            respond(stream, &body, "200 OK");
         }
         Route::Feed => {
             let (_ticks, reconnects, sockets) = config.counts.snapshot();

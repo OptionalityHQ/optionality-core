@@ -253,7 +253,9 @@ pub fn index_json(asset: Asset, summary: &Summary, now_ms: u64, scale: u128) -> 
     json!({
         "asset": asset.symbol(),
         "status": summary.status.label(),
-        "quotable": true,
+        // A degraded index is still a print. Whether the venue will *quote* on it
+        // is a separate question, and answered by this flag.
+        "quotable": summary.status == Status::Live,
         "price": observation.price,
         // Raw u128 for the oracle's `price`, which the SDK reads as a number.
         "priceUnits": (observation.price * scale as f64).round() as u128,

@@ -187,11 +187,17 @@ pub struct Observation {
 }
 
 impl Summary {
-    /// The only observation the engine is allowed to submit: nothing from a
-    /// degraded or stale index, because the venue would then be settling on a
-    /// number it has told the trader it does not trust.
+    /// The observation the engine may submit for settlement.
+    ///
+    /// One source is not an index and a stale one is not a price, so neither can
+    /// fix a series. Two sources that disagree *are* an index: the disagreement
+    /// is exactly what `confidence_bps` measures, and the contract's per-series
+    /// floor is where it gets refused. Withholding the print instead made a
+    /// 25-basis-point minute unfixable even though the chain would have accepted
+    /// the number at 95% confidence. Quoting stays live-only — that is a risk
+    /// appetite, not a fact about the print.
     pub fn observation(&self, now_ms: u64) -> Option<Observation> {
-        if !self.status.is_quotable() {
+        if self.fresh_sources < 2 || !matches!(self.status, Status::Live | Status::Degraded) {
             return None;
         }
         let price = self.median?;
@@ -322,6 +328,20 @@ mod tests {
             "a lone source must read as capped, not as certain"
         );
         assert!(summary.observation(now).is_none(), "a degraded index may not fix a series");
+    }
+
+    #[test]
+    fn two_disagreeing_sources_are_a_print_with_a_lower_confidence() {
+        let now = 100_000;
+        let strict = prints(&[("binance", 2350.0, now - 100), ("coinbase", 2356.0, now - 100)]);
+        let summary = summarise(&strict, now, &Options::default());
+        assert_eq!(summary.status, Status::Degraded, "60 bps is past the degenerate spread");
+        let print = summary.observation(now).expect("two sources are an index");
+        assert_eq!(print.price, 2353.0, "the median, not either venue");
+        // 25 bps of disagreement costs 20 bps of confidence apiece, so the number
+        // lands just under 9,500 and stays well above the 3,000 floor a series
+        // is created with.
+        assert!(print.confidence_bps < 9_500 && print.confidence_bps > 9_400, "{}", print.confidence_bps);
     }
 
     #[test]

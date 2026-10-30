@@ -184,17 +184,22 @@ pub struct Print {
     pub confidence_bps: u64,
 }
 
-/// Read `GET /index`. A print that is not quotable is an error carrying the
-/// engine's own reason, because the alternative would be reporting a price the
-/// venue has already told its traders it does not trust.
+/// Read `GET /index`.
+///
+/// A body without a price is the engine saying it has no index — no prints, or
+/// none fresh — and its `reason` travels with the error. A body *with* a price is
+/// read whatever its `quotable` flag says: quotable is the venue's appetite for
+/// making markets on the number, while the series' `min_confidence_bps` is the
+/// chain's rule for settling on it, and the confidence always carries how much
+/// the venues disagreed.
 pub fn parse_print(body: &str) -> Result<Print, String> {
     let value: Value = serde_json::from_str(body).map_err(|e| format!("index is not JSON: {e}"))?;
-    if value.get("quotable").and_then(Value::as_bool) != Some(true) {
+    if value.get("priceUnits").is_none() {
         let reason = value
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or("no reason given");
-        return Err(format!("engine will not stake a print: {reason}"));
+        return Err(format!("engine has no print: {reason}"));
     }
     let price_units = amount(value.get("priceUnits").ok_or("priceUnits is missing")?)
         .ok_or("priceUnits is not an integer")?;
@@ -336,6 +341,28 @@ pub fn parse_state(body: &str) -> Result<(u64, Vec<QuotePlan>), String> {
         }
     }
     Ok((expiry_ns as u64, plans))
+}
+
+/// Series whose accept window closed while still Open.
+///
+/// A series can only be fixed inside that window, so once it has passed, every
+/// ticket in it is stuck: `settle_ticket` refuses an unfixed series and the vault
+/// will not buy it back. Voiding is the only exit left, and it is permissionless
+/// on purpose — the operator is the party that can see the window close.
+pub fn voidable(rows: &[(u64, Value)], now_ns: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    for (series_id, row) in rows {
+        if row.get("settlement").and_then(Value::as_str) != Some("Open") {
+            continue;
+        }
+        let Some(finalize_until_ns) = row.get("finalize_until_ns").and_then(Value::as_u64) else {
+            continue;
+        };
+        if now_ns >= finalize_until_ns {
+            out.push(*series_id);
+        }
+    }
+    out
 }
 
 /// Which open series need a quote posted, as `(series_id, mid_units)`.
@@ -704,7 +731,16 @@ mod tests {
         assert!(parse_print(&json!({"quotable": false, "reason": "x"}).to_string())
             .unwrap_err()
             .contains("x"));
-        assert!(parse_print(&json!({"quotable": true}).to_string()).unwrap_err().contains("priceUnits"));
+        assert!(parse_print(&json!({"quotable": true}).to_string()).unwrap_err().contains("no print"));
+        // A print the venue would not *quote* is still a print the chain may
+        // settle on: the confidence carries the disagreement, and the series'
+        // own floor is the gate.
+        let degraded = parse_print(
+            &json!({"quotable": false, "priceUnits": 1u64, "publishTimeNs": 1u64, "confidenceBps": 4_000u64})
+                .to_string(),
+        )
+        .expect("a degraded print is still a print");
+        assert_eq!(degraded.confidence_bps, 4_000);
         assert!(parse_print(
             &json!({"quotable": true, "priceUnits": 0u64, "publishTimeNs": 1u64, "confidenceBps": 1u64}).to_string()
         )
@@ -826,6 +862,17 @@ mod tests {
         let aged = quotes_needed(&plans, 900, &rows, &fresh, 931, 30);
         assert_eq!(aged, vec![(0, 55_000)], "31 ns past a 30 ns renew window");
         assert!(quotes_needed(&plans, 900, &rows, &fresh, 929, 30).is_empty());
+    }
+
+    #[test]
+    fn a_series_that_ran_out_of_window_is_voidable() {
+        let mut row = open_row(900, 2_300, 2_400, "Put");
+        row["finalize_until_ns"] = json!(1_000u64);
+        let rows = vec![(7, row.clone())];
+        assert!(voidable(&rows, 999).is_empty(), "the window is still open");
+        assert_eq!(voidable(&rows, 1_000), vec![7], "the deadline itself counts");
+        row["settlement"] = json!("Fixed");
+        assert!(voidable(&vec![(7, row)], 2_000).is_empty(), "a fixed series is settled, not voided");
     }
 
     #[test]

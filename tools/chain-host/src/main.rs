@@ -182,9 +182,23 @@ async fn fix_due(
     let engine = engine.trim_end_matches('/');
     let mut reported = 0usize;
     for (feed, asset) in operator::feeds_needing_prints(&due) {
-        let body = operator::http_get(&format!("{engine}/index?asset={asset}")).map_err(anyhow::Error::msg)?;
-        let print = operator::parse_print(&body)
-            .map_err(|e| anyhow::anyhow!("no print for {feed}: {e}"))?;
+        // One unusable print is not a reason to drop the whole pass: the other
+        // feed may be perfectly quotable, and the series that cannot be fixed
+        // here are voided once their window closes.
+        let body = match operator::http_get(&format!("{engine}/index?asset={asset}")) {
+            Ok(body) => body,
+            Err(error) => {
+                println!("no print for {feed}: {error}");
+                continue;
+            }
+        };
+        let print = match operator::parse_print(&body) {
+            Ok(print) => print,
+            Err(error) => {
+                println!("no print for {feed}: {error}");
+                continue;
+            }
+        };
         if last_print_ns.get(&feed).is_some_and(|last| print.publish_time_ns <= *last) {
             // The clock has not moved since the last report on this feed. Waiting
             // one more pass is right; panicking on the oracle would not be.
@@ -538,6 +552,25 @@ async fn main() -> Result<()> {
                 Ok((reported, asked)) if asked > 0 => println!("fixed {asked} series on {reported} feed prints"),
                 Ok(_) => {}
                 Err(error) => println!("fixing failed, chain still live: {error}"),
+            }
+            // A series whose window closed unfixed can never pay: voiding it is
+            // what returns the premium instead of leaving the ticket open for
+            // the life of the contract.
+            for series_id in operator::voidable(&rows, now_ns) {
+                // Both failure shapes — a transport error and a reverted receipt —
+                // are reported the same way, so one stuck series cannot end the tick.
+                let outcome = admin
+                    .call(options.id(), "void_series")
+                    .args_json(json!({ "series_id": series_id }))
+                    .gas(GAS)
+                    .transact()
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|sent| sent.into_result().map_err(|error| format!("{error:?}")));
+                match outcome {
+                    Ok(_) => println!("voided {series_id}: no print inside the accept window"),
+                    Err(error) => println!("void failed for {series_id}: {error}"),
+                }
             }
         }
     }
