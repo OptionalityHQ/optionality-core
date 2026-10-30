@@ -85,17 +85,43 @@ async fn chain_series(options: &Contract) -> Result<Vec<(u64, serde_json::Value)
 /// Only the *missing* series are sent, so a re-list is a few reads and no
 /// transactions: series ids are assigned from zero and never reused, which makes
 /// `get_series` over `0..series_count` a complete picture of what is listed.
-/// The expiry of the ladder the engine is marking. It rolls before it dies, so
-/// this is a moving target the operator has to keep up with.
-async fn engine_expiry(engine: &str) -> Result<u64> {
+/// `HH:MM UTC` for a nanosecond stamp, so a log line says which ladder it means.
+fn stamp(ns: u64) -> String {
+    let secs = (ns / 1_000_000_000) % 86_400;
+    format!("{:02}:{:02} UTC", secs / 3600, (secs % 3600) / 60)
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// The expiries the engine lists, nearest first.
+///
+/// One ladder became seven: two inside the day and a daily close out to a week.
+/// The operator lists and quotes every one of them, which is what makes the strip
+/// on the screen a set of markets rather than a single one.
+async fn engine_expiries(engine: &str) -> Result<Vec<u64>> {
     let health: serde_json::Value = serde_json::from_str(
         &operator::http_get(&format!("{}/health", engine.trim_end_matches('/'))).map_err(anyhow::Error::msg)?,
     )
     .context("engine /health is not JSON")?;
+    if let Some(list) = health.get("expiries").and_then(serde_json::Value::as_array) {
+        let mut out: Vec<u64> = list.iter().filter_map(serde_json::Value::as_u64).collect();
+        out.sort_unstable();
+        out.dedup();
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    // An older engine names one expiry; that is still a schedule of one.
     health
         .get("expiryNs")
         .and_then(serde_json::Value::as_u64)
-        .context("engine /health has no expiryNs")
+        .map(|one| vec![one])
+        .context("engine /health has no expiries")
 }
 
 /// Whether the chain already holds the ladder the engine is marking.
@@ -104,14 +130,12 @@ async fn engine_expiry(engine: &str) -> Result<u64> {
 /// operator quotes only series whose expiry the engine named, so until the next
 /// listing pass every cell on the screen is untradeable. An unreachable engine
 /// answers "listed", because the cadence will retry it either way.
-async fn ladder_is_listed(engine: &str, rows: &[(u64, serde_json::Value)]) -> bool {
-    let wanted = match engine_expiry(engine).await {
-        Ok(expiry_ns) => expiry_ns,
-        Err(_) => return true,
-    };
-    rows.iter().any(|(_, row)| {
-        row.get("settlement").and_then(serde_json::Value::as_str) == Some("Open")
-            && row.get("expiry_ns").and_then(serde_json::Value::as_u64) == Some(wanted)
+fn ladder_is_listed(rows: &[(u64, serde_json::Value)], expiries: &[u64]) -> bool {
+    expiries.iter().all(|wanted| {
+        rows.iter().any(|(_, row)| {
+            row.get("settlement").and_then(serde_json::Value::as_str) == Some("Open")
+                && row.get("expiry_ns").and_then(serde_json::Value::as_u64) == Some(*wanted)
+        })
     })
 }
 
@@ -121,9 +145,10 @@ async fn list_ladder(
     engine: &str,
     assets: &[String],
     rows: &[(u64, serde_json::Value)],
+    expiries: &[u64],
+    budget: usize,
 ) -> Result<(usize, usize)> {
     let engine = engine.trim_end_matches('/');
-    let expiry_ns = engine_expiry(engine).await?;
 
     let mut existing: Vec<operator::Listed> = rows
         .iter()
@@ -132,28 +157,37 @@ async fn list_ladder(
 
     let mut planned = 0usize;
     let mut created = 0usize;
-    for asset in assets {
-        let body = operator::http_get(&format!("{engine}/plan?asset={asset}&expiry_ns={expiry_ns}"))
-            .map_err(anyhow::Error::msg)?;
-        let plans = operator::parse_plan(&body)
-            .map_err(|e| anyhow::anyhow!("plan for {asset}: {e}"))?;
-        planned += plans.len();
-        for plan in operator::missing(&plans, &existing) {
-            admin
-                .call(options.id(), "create_series")
-                .args_json(plan.args())
-                .gas(GAS)
-                .transact()
-                .await?
-                .into_result()?;
-            existing.push(operator::Listed {
-                underlying: plan.underlying.clone(),
-                kind: plan.kind.clone(),
-                expiry_ns: plan.expiry_ns,
-                low_units: plan.low_units,
-                high_units: plan.high_units,
-            });
-            created += 1;
+    // A week of ladders is five hundred series, and a sandbox commits them about
+    // four to the second. Listing them in one pass kept the venue dark for four
+    // minutes, so each pass spends a budget and the next pass continues — the
+    // nearest ladder is complete long before the furthest one starts.
+    'ladders: for expiry_ns in expiries.iter().copied() {
+        for asset in assets {
+            let body = operator::http_get(&format!("{engine}/plan?asset={asset}&expiry_ns={expiry_ns}"))
+                .map_err(anyhow::Error::msg)?;
+            let plans = operator::parse_plan(&body)
+                .map_err(|e| anyhow::anyhow!("plan for {asset}: {e}"))?;
+            planned += plans.len();
+            for plan in operator::missing(&plans, &existing) {
+                if created >= budget {
+                    break 'ladders;
+                }
+                admin
+                    .call(options.id(), "create_series")
+                    .args_json(plan.args())
+                    .gas(GAS)
+                    .transact()
+                    .await?
+                    .into_result()?;
+                existing.push(operator::Listed {
+                    underlying: plan.underlying.clone(),
+                    kind: plan.kind.clone(),
+                    expiry_ns: plan.expiry_ns,
+                    low_units: plan.low_units,
+                    high_units: plan.high_units,
+                });
+                created += 1;
+            }
         }
     }
     Ok((created, planned))
@@ -246,49 +280,67 @@ async fn quote_ladder(
     engine: &str,
     assets: &[String],
     rows: &[(u64, serde_json::Value)],
+    expiry_ns: u64,
+    live: &std::collections::HashMap<u64, operator::Standing>,
     now_ns: u64,
     renew_ns: u64,
 ) -> Result<(usize, usize)> {
     let engine = engine.trim_end_matches('/');
-    let mut live = std::collections::HashMap::new();
-    for (series_id, _) in rows {
-        let quote = options
-            .view("get_pool_quote")
-            .args_json(json!({ "series_id": series_id }))
-            .await?
-            .json::<serde_json::Value>()?;
-        let Some(standing) = operator::standing_quote(&quote) else {
-            continue;
-        };
-        live.insert(*series_id, standing);
-    }
-
     let mut posted = 0usize;
     let mut priced = 0usize;
     for asset in assets {
-        let body = operator::http_get(&format!("{engine}/state?asset={asset}"))
+        let body = operator::http_get(&format!("{engine}/state?asset={asset}&expiry_ns={expiry_ns}"))
             .map_err(anyhow::Error::msg)?;
-        let (expiry_ns, plans) =
+        let (expiry, plans) =
             operator::parse_state(&body).map_err(|e| anyhow::anyhow!("state for {asset}: {e}"))?;
         priced += plans.iter().filter(|plan| plan.mid_units > 0).count();
-        for (series_id, mid_units) in
-            operator::quotes_needed(&plans, expiry_ns, rows, &live, now_ns, renew_ns)
-        {
+        let needed = operator::quotes_needed(&plans, expiry, rows, live, now_ns, renew_ns);
+        // A ladder is one write, not sixty: the batch is what lets the operator
+        // refresh seven tenors inside the sixty-second age the contract allows.
+        for chunk in needed.chunks(64) {
+            let series_ids: Vec<u64> = chunk.iter().map(|(series_id, _)| *series_id).collect();
+            let mid_units: Vec<String> = chunk.iter().map(|(_, mid)| mid.to_string()).collect();
             venue
-                .call(options.id(), "set_pool_quote")
+                .call(options.id(), "set_pool_quotes")
                 .args_json(json!({
-                    "series_id": series_id,
-                    "mid_units": mid_units.to_string(),
+                    "series_ids": series_ids,
+                    "mid_units": mid_units,
                     "stamp_ns": now_ns,
                 }))
                 .gas(GAS)
                 .transact()
                 .await?
                 .into_result()?;
-            posted += 1;
+            posted += chunk.len();
         }
     }
     Ok((posted, priced))
+}
+
+/// The quotes standing on the series of one expiry.
+///
+/// Read per expiry rather than for the whole chain: with seven ladders that is a
+/// seventh of the calls, and the map is only ever asked about one of them.
+async fn read_standing(
+    options: &Contract,
+    rows: &[(u64, serde_json::Value)],
+    expiry_ns: u64,
+) -> Result<std::collections::HashMap<u64, operator::Standing>> {
+    let mut live = std::collections::HashMap::new();
+    for (series_id, row) in rows {
+        if row.get("expiry_ns").and_then(serde_json::Value::as_u64) != Some(expiry_ns) {
+            continue;
+        }
+        let quote = options
+            .view("get_pool_quote")
+            .args_json(json!({ "series_id": series_id }))
+            .await?
+            .json::<serde_json::Value>()?;
+        if let Some(standing) = operator::standing_quote(&quote) {
+            live.insert(*series_id, standing);
+        }
+    }
+    Ok(live)
 }
 
 fn wasm(relative: &str) -> Result<Vec<u8>> {    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(relative);
@@ -412,8 +464,10 @@ async fn main() -> Result<()> {
     // yesterday's price. Ten seconds against a sixty-second limit leaves six
     // passes of slack, and it keeps the price the trader clicks close to the
     // price the contract charges.
+    // The longest a pass may take. With several ladders it is the *cycle* that
+    // has to stay under the contract's sixty-second quote age, so the effective
+    // step is the smaller of this and the schedule divided by that budget.
     let quote_secs: u64 = arg("--quote-secs", "10").parse().context("--quote-secs must be seconds")?;
-    let renew_ns = quote_secs * 1_000_000_000;
     let assets_list = assets();
     let mut listed = (0usize, 0usize);
     if let Some(url) = &engine {
@@ -423,8 +477,11 @@ async fn main() -> Result<()> {
         // rather than taken for a broken venue: the host exiting here would leave
         // no session file at all, and the gateway would come up pointed at the
         // previous run's dead sandbox.
+        let expiries = engine_expiries(url).await?;
+        println!("engine lists {} expiries, nearest in {}h", expiries.len(), (expiries[0].saturating_sub(now_ns()) / 3_600_000_000_000));
         for attempt in 1.. {
-            match list_ladder(&admin, &options, url, &assets_list, &chain_series(&options).await?).await {
+            let current = chain_series(&options).await?;
+            match list_ladder(&admin, &options, url, &assets_list, &current, &expiries, 200).await {
                 Ok(out) => {
                     listed = out;
                     println!("listed {} of {} series from the engine", out.0, out.1);
@@ -437,13 +494,20 @@ async fn main() -> Result<()> {
                 Err(error) => return Err(error).with_context(|| format!("listing the ladder from {url}")),
             }
         }
-        // …and quoted, so the first visitor to arrive finds a vault that is
-        // already selling rather than five seconds of "no price yet".
+        // …and quoted, expiry by expiry, so the first visitor finds a vault that
+        // is already selling rather than five seconds of "no price yet".
         let rows = chain_series(&options).await?;
         let now_ns = worker.view_block().await?.timestamp();
-        match quote_ladder(&admin, &options, url, &assets_list, &rows, now_ns, renew_ns).await {
-            Ok((posted, priced)) => println!("quoted {posted} of {priced} priced cells"),
-            Err(error) => println!("quoting failed, chain still live: {error}"),
+        // The nearest ladder only: the tick loop walks the rest, and a boot that
+        // quotes a week of ladders is a boot nobody waits for.
+        for expiry_ns in expiries.iter().copied().take(1) {
+            match read_standing(&options, &rows, expiry_ns).await {
+                Ok(live) => match quote_ladder(&admin, &options, url, &assets_list, &rows, expiry_ns, &live, now_ns, quote_secs * 1_000_000_000).await {
+                    Ok((posted, priced)) => println!("quoted {posted} of {priced} priced cells at {}", stamp(expiry_ns)),
+                    Err(error) => println!("quoting failed, chain still live: {error}"),
+                },
+                Err(error) => println!("quote read failed, chain still live: {error}"),
+            }
         }
     }
 
@@ -518,6 +582,7 @@ async fn main() -> Result<()> {
         let mut last_print: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let mut since_list = list_secs;
         let mut since_quote = quote_secs;
+        let mut cursor = 0usize;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(tick_secs)).await;
             since_list += tick_secs;
@@ -529,23 +594,46 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
-            if since_list >= list_secs || !ladder_is_listed(url, &rows).await {
+            let expiries = match engine_expiries(url).await {
+                Ok(list) => list,
+                Err(error) => {
+                    println!("engine schedule unreadable, chain still live: {error}");
+                    continue;
+                }
+            };
+            if since_list >= list_secs || !ladder_is_listed(&rows, &expiries) {
                 since_list = 0;
-                match list_ladder(&admin, &options, url, &assets_list, &rows).await {
+                match list_ladder(&admin, &options, url, &assets_list, &rows, &expiries, 200).await {
                     Ok((created, planned)) if created > 0 => println!("listed {created} of {planned} series"),
                     Ok((_, planned)) => println!("ladder unchanged · {planned} series planned"),
                     Err(error) => println!("listing failed, chain still live: {error}"),
                 }
             }
             let now_ns = worker.view_block().await?.timestamp();
-            if since_quote >= quote_secs {
+            // One ladder per pass, round-robin. The cycle has to stay inside the
+            // contract's sixty-second quote age or the far expiries stop trading
+            // between visits, so the step shrinks as the schedule grows.
+            let step = quote_secs.min((40 / expiries.len().max(1) as u64).max(2));
+            if since_quote >= step && !expiries.is_empty() {
                 since_quote = 0;
-                match quote_ladder(&admin, &options, url, &assets_list, &rows, now_ns, renew_ns).await {
-                    // A still index re-posts nothing, so the line only prints
-                    // when the venue actually said something new.
-                    Ok((0, _)) => {}
-                    Ok((posted, priced)) => println!("re-quoted {posted} of {priced} priced cells"),
-                    Err(error) => println!("quoting failed, chain still live: {error}"),
+                let expiry_ns = expiries[cursor % expiries.len()];
+                cursor = (cursor + 1) % expiries.len();
+                let renew_ns = step * 1_000_000_000;
+                match read_standing(&options, &rows, expiry_ns).await {
+                    Ok(live) => match quote_ladder(
+                        &admin, &options, url, &assets_list, &rows, expiry_ns, &live, now_ns, renew_ns,
+                    )
+                    .await
+                    {
+                        // A still index re-posts nothing, so the line only prints
+                        // when the venue actually said something new.
+                        Ok((0, _)) => {}
+                        Ok((posted, priced)) => {
+                            println!("re-quoted {posted} of {priced} priced cells at {}", stamp(expiry_ns))
+                        }
+                        Err(error) => println!("quoting failed, chain still live: {error}"),
+                    },
+                    Err(error) => println!("quote read failed, chain still live: {error}"),
                 }
             }
             match fix_due(&admin, &options, &oracle, url, &rows, now_ns, &mut last_print).await {

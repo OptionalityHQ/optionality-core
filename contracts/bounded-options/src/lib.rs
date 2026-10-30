@@ -33,9 +33,16 @@ const PRICE_BOUND_FACTOR: u128 = 10;
 /// venue itself published, and a published price is only worth what it said
 /// while it is still current.
 const MAX_QUOTE_AGE_NS: u64 = 60 * 1_000_000_000;
+/// How stale a quote may be on a ladder that is days away. The freshness a market
+/// needs scales with how near it is: an hour out has to be a minute fresh, a week
+/// out can afford five, and the operator refreshes seven ladders in rotation.
+const MAX_QUOTE_AGE_FAR_NS: u64 = 300 * 1_000_000_000;
 /// A quote may carry a stamp a little ahead of the chain clock; the gateway and
 /// the host read different clocks and a few milliseconds of skew is normal.
 const MAX_QUOTE_SLACK_NS: u64 = 5 * 1_000_000_000;
+/// One batched quote write covers a whole ladder and no more, the same ceiling
+/// `get_pool_prices` puts on a read.
+const MAX_QUOTES_PER_CALL: usize = 64;
 
 #[derive(BorshStorageKey, BorshSerialize)]
 #[borsh(crate = "near_sdk::borsh")]
@@ -486,7 +493,30 @@ impl Contract {
     /// number, so nobody can name a price that is not the venue's.
     pub fn set_pool_quote(&mut self, series_id: u64, mid_units: U128, stamp_ns: u64) {
         self.assert_venue();
-        require!(mid_units.0 > 0, "a quote must be positive");
+        self.write_quote(series_id, mid_units.0, stamp_ns);
+    }
+
+    /// The same write for a whole ladder.
+    ///
+    /// One transaction per series does not scale to seven tenors: a ladder is
+    /// sixty cells, and at one call each a venue with a week of expiries cannot
+    /// refresh them inside its own quote age. Batching keeps a ladder one write,
+    /// so what the screen offers never depends on how many markets it lists.
+    pub fn set_pool_quotes(&mut self, series_ids: Vec<u64>, mid_units: Vec<U128>, stamp_ns: u64) {
+        self.assert_venue();
+        require!(
+            series_ids.len() == mid_units.len(),
+            "every series needs exactly one mid"
+        );
+        // Bounded like `get_pool_prices`: one call, one block's worth of work.
+        require!(series_ids.len() <= MAX_QUOTES_PER_CALL, "too many quotes at once");
+        for (series_id, mid) in series_ids.into_iter().zip(mid_units.into_iter()) {
+            self.write_quote(series_id, mid.0, stamp_ns);
+        }
+    }
+
+    fn write_quote(&mut self, series_id: u64, mid_units: u128, stamp_ns: u64) {
+        require!(mid_units > 0, "a quote must be positive");
         let series = self.series.get(&series_id).expect("series not found");
         require!(series.settlement == Settlement::Open, "series not open");
         // A stamp in the future is a quote that never goes stale, which is the
@@ -498,7 +528,7 @@ impl Contract {
         self.pool_quotes.insert(
             series_id,
             Quote {
-                mid_units: mid_units.0,
+                mid_units,
                 stamp_ns,
             },
         );
@@ -1800,7 +1830,7 @@ impl Contract {
                 if series.settlement != Settlement::Open || quote.mid_units == 0 {
                     return None;
                 }
-                if now.saturating_sub(quote.stamp_ns) > MAX_QUOTE_AGE_NS {
+                if now.saturating_sub(quote.stamp_ns) > Self::quote_age_allowed(series.expiry_ns, now) {
                     return None;
                 }
                 let entry = terms.entry_premium(quantity.0, quote.mid_units, series.price_scale)?;
@@ -2172,12 +2202,29 @@ impl Contract {
     /// a pool trade, never a price — which is the only arrangement that survives
     /// a moving index, because a price echoed at read time is stale by the time
     /// the transaction lands.
+    /// A quote is stale relative to the market it prices: inside the day it has
+    /// to be a minute fresh, beyond it five will do. Without this the operator
+    /// had to refresh seven ladders inside one minute to keep the nearest
+    /// tradeable, and the far ones spent their lives expired.
+    fn quote_age_allowed(expiry_ns: u64, now_ns: u64) -> u64 {
+        const DAY_NS: u64 = 24 * 3_600 * 1_000_000_000;
+        if expiry_ns.saturating_sub(now_ns) <= DAY_NS {
+            MAX_QUOTE_AGE_NS
+        } else {
+            MAX_QUOTE_AGE_FAR_NS
+        }
+    }
+
     fn live_quote(&self, series_id: u64) -> u128 {
         let Some(quote) = self.pool_quotes.get(&series_id) else {
             env::panic_str("the venue has not quoted this series");
         };
         let age = env::block_timestamp().saturating_sub(quote.stamp_ns);
-        require!(age <= MAX_QUOTE_AGE_NS, "the venue's quote for this series has expired");
+        let allowed = Self::quote_age_allowed(
+            self.series.get(&series_id).expect("series not found").expiry_ns,
+            env::block_timestamp(),
+        );
+        require!(age <= allowed, "the venue's quote for this series has expired");
         quote.mid_units
     }
 
@@ -3697,6 +3744,59 @@ mod tests {
             contract.pool_withdraw(U128(SCALE))
         }))
         .is_err());
+    }
+
+    /// One write for a whole ladder, with the same rules on every cell: a week
+    /// of expiries is sixty cells per tenor, and a transaction per cell cannot
+    /// keep seven tenors inside the quote age the venue promises.
+    #[test]
+    fn a_ladder_is_quoted_in_one_call() {
+        let mut contract = setup();
+        let a = series(&mut contract);
+        let b = series(&mut contract);
+        testing_env!(context(accounts(0), T0).build());
+        contract.set_pool_quotes(
+            vec![a, b],
+            vec![U128(3 * SCALE), U128(4 * SCALE)],
+            T0,
+        );
+        assert_eq!(contract.get_pool_quote(a).unwrap().mid_units, 3 * SCALE);
+        assert_eq!(contract.get_pool_quote(b).unwrap().mid_units, 4 * SCALE);
+        assert_eq!(contract.get_pool_quote(a).unwrap().stamp_ns, T0);
+
+        // The guards are per cell, not per call: one bad mid refuses the batch
+        // rather than writing half a ladder.
+        let before = contract.get_pool_quote(a).unwrap().mid_units;
+        assert!(refused(|| contract.set_pool_quotes(vec![a], vec![U128(0)], T0)));
+        assert!(refused(|| contract.set_pool_quotes(vec![a, b], vec![U128(1)], T0)));
+        assert!(refused(|| contract
+            .set_pool_quotes(vec![a], vec![U128(1)], T0 + MAX_QUOTE_SLACK_NS + 1_000_000_000)));
+        assert_eq!(contract.get_pool_quote(a).unwrap().mid_units, before);
+
+        // And it answers to the venue, exactly like the single write.
+        testing_env!(context(accounts(4), T0).build());
+        assert!(refused(|| contract.set_pool_quotes(vec![a], vec![U128(1)], T0)));
+    }
+
+    /// The age a quote may reach scales with how near its market is, so a week
+    /// of ladders can be refreshed in rotation without the far ones expiring.
+    #[test]
+    fn a_far_ladder_may_be_quoted_less_often_than_a_near_one() {
+        let now = T0;
+        let near = now + 30 * 60 * 1_000_000_000;
+        let inside = now + 23 * 3_600 * 1_000_000_000;
+        let far = now + 7 * 24 * 3_600 * 1_000_000_000;
+        assert_eq!(Contract::quote_age_allowed(near, now), MAX_QUOTE_AGE_NS);
+        assert_eq!(Contract::quote_age_allowed(inside, now), MAX_QUOTE_AGE_NS);
+        assert_eq!(Contract::quote_age_allowed(far, now), MAX_QUOTE_AGE_FAR_NS);
+        // It never shrinks below the near-tenor rule, and never grows past the
+        // far one, whatever the clock says.
+        assert_eq!(Contract::quote_age_allowed(0, now), MAX_QUOTE_AGE_NS);
+        assert_eq!(
+            Contract::quote_age_allowed(now + 365 * 24 * 3_600 * 1_000_000_000, now),
+            MAX_QUOTE_AGE_FAR_NS,
+            "and a year out is no looser than a week"
+        );
     }
 
     /// The round trip this contract must never allow: buy a ticket for a

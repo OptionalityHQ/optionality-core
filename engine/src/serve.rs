@@ -318,7 +318,7 @@ pub fn feed_json(tape: &Tape, assets: &[Asset], now_ms: u64, options: &Options, 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
     Health,
-    State(Asset),
+    State(Asset, Option<u64>),
     Plan(Asset, u64),
     Index(Asset, u128),
     Feed,
@@ -347,7 +347,12 @@ pub fn route(path: &str) -> Route {
         .unwrap_or(Asset::Eth);
     match head {
         "/health" => Route::Health,
-        "/state" => Route::State(asset),
+        // A state read names the expiry it is about; without one it is the
+        // nearest the venue lists, which is the ladder a screen opens on.
+        "/state" => Route::State(
+            asset,
+            found.get("expiry_ns").and_then(|value| value.parse::<u64>().ok()),
+        ),
         "/plan" => match found.get("expiry_ns").and_then(|value| value.parse::<u64>().ok()) {
             Some(expiry_ns) => Route::Plan(asset, expiry_ns),
             None => Route::Unknown,
@@ -384,24 +389,44 @@ pub fn status_line(asset: Asset, summary: &Summary, listed: usize, feed: &str) -
     )
 }
 
-/// The expiry of the ladder to serve right now.
+/// The expiries still ahead, nearest first.
 ///
-/// A ladder that simply ends takes the venue down with it: the chain's series
-/// expire, the operator has nothing new to list because the engine kept naming
-/// the same dead expiry, and the screen is left quoting a market that no longer
-/// exists. So the tenor rolls while there is still room for the operator to list
-/// and quote the next ladder — `lead_ns` is that room, and it is why the roll is
-/// early rather than on the deadline.
-pub fn roll_expiry(standing: u64, now_ns: u64, tenor_ns: u64, lead_ns: u64) -> u64 {
-    // A lead as long as the tenor would roll on every request, and the operator
-    // would list a new ladder forever. The warning window is a fraction of the
-    // ladder's life, never all of it.
-    let lead = lead_ns.min(tenor_ns / 2);
-    if standing.saturating_sub(now_ns) > lead {
-        standing
+/// A ladder that has run off is no longer a market: the operator stops listing
+/// it, the screen stops defaulting to it, and its tickets are settled or voided
+/// by the same clock. The full schedule comes back only when every expiry has
+/// passed, so a stopped venue still answers with the last ladder it had.
+pub fn upcoming(expiries: &[u64], now_ns: u64) -> Vec<u64> {
+    let live: Vec<u64> = expiries.iter().copied().filter(|ns| *ns > now_ns).collect();
+    if live.is_empty() {
+        expiries.to_vec()
     } else {
-        now_ns.saturating_add(tenor_ns)
+        live
     }
+}
+
+/// The expiries this venue lists.
+///
+/// Two inside the day, so there is always something hours away, then a daily
+/// close at 08:00 UTC out to a week. Five of the seven land inside three days,
+/// which is where a spread actually trades; the last two are there so the strip
+/// reads like a venue rather than like a single market.
+pub fn schedule(now_ns: u64, near_ns: u64) -> Vec<u64> {
+    const HOUR: u64 = 3_600_000_000_000;
+    const DAY: u64 = 24 * HOUR;
+    let near = near_ns.max(HOUR / 60);
+    let mut expiries = vec![now_ns + near, now_ns + near.max(12 * HOUR)];
+    // The daily close: 08:00 UTC, the hour a listed option expires.
+    let close = (now_ns / DAY) * DAY + 8 * HOUR;
+    for day in [1u64, 2, 3, 5, 7] {
+        let mut expiry = close + day * DAY;
+        while expiry <= now_ns {
+            expiry += DAY;
+        }
+        expiries.push(expiry);
+    }
+    expiries.sort_unstable();
+    expiries.dedup();
+    expiries
 }
 
 #[cfg(test)]
@@ -418,30 +443,40 @@ mod tests {
     }
 
     #[test]
-    fn the_ladder_rolls_before_it_dies() {
-        let hour = 3_600_000_000_000;
-        let standing = 10 * hour;
-        // Plenty of life left: the same ladder, because a venue that changes its
-        // expiry mid-flight makes the operator list a new one for nothing.
-        assert_eq!(roll_expiry(standing, 9 * hour, hour, 10 * 60 * 1_000_000_000), standing);
-        // Inside the lead: the next tenor, measured from now, so the operator has
-        // the whole lead window to list and quote it before this one settles.
-        let lead = 10 * 60 * 1_000_000_000;
-        let rolled = roll_expiry(standing, standing - lead, hour, lead);
-        assert_eq!(rolled, standing - lead + hour, "the new tenor starts from now, not from the old expiry");
-        assert!(rolled > standing, "and it outlives the ladder it replaces");
-        // Past the deadline it still rolls, and the new ladder is a full tenor
-        // away rather than a stub.
-        assert!(roll_expiry(standing, standing + hour, hour, 60 * 1_000_000_000) > standing + hour);
-        // A lead longer than the tenor cannot make it roll on every request.
-        let tenor = 1_000_000_000;
-        let once = roll_expiry(5 * tenor, 4 * tenor, tenor, 100 * tenor);
-        assert_eq!(once, 5 * tenor, "half the tenor is the most warning a ladder gets");
-        assert_eq!(
-            roll_expiry(once, once - tenor / 2, tenor, 100 * tenor),
-            once + tenor / 2,
-            "and it rolls exactly at that point, not on every poll after"
-        );
+    fn an_expiry_that_has_passed_is_no_longer_offered() {
+        let hour = 3_600_000_000_000u64;
+        let now = 1_000 * hour;
+        let all = vec![now - hour, now + hour, now + 3 * hour];
+        assert_eq!(upcoming(&all, now), vec![now + hour, now + 3 * hour]);
+        // Every expiry past: the schedule still answers, so a stopped venue
+        // reports the last ladder rather than an empty one.
+        assert_eq!(upcoming(&all, now + 4 * hour), all);
+    }
+
+    #[test]
+    fn the_venue_lists_a_week_with_most_of_it_inside_three_days() {
+        let hour = 3_600_000_000_000u64;
+        let now = 1_793_280_000 * 1_000_000_000; // 08:00 UTC, the daily close
+        let expiries = schedule(now, 4 * hour);
+        assert_eq!(expiries.len(), 7, "{expiries:?}");
+        assert!(expiries.windows(2).all(|pair| pair[0] < pair[1]), "sorted and distinct");
+        assert_eq!(expiries[0], now + 4 * hour, "the near tenor is the one asked for");
+        let inside_three_days = expiries.iter().filter(|ns| **ns <= now + 3 * 24 * hour).count();
+        assert_eq!(inside_three_days, 5, "most of the ladder is inside three days");
+        // The last close is 08:00 UTC on day seven, which from a mid-afternoon
+        // start is six and a half days out rather than exactly seven.
+        let furthest = *expiries.last().unwrap();
+        assert!(furthest >= now + 6 * 24 * hour, "and it reaches into next week");
+
+        // A near tenor shorter than the intraday step keeps its own slot: the
+        // settle demo runs a three-minute expiry, not a day.
+        let short = schedule(now, 3 * 60 * 1_000_000_000);
+        assert_eq!(short[0], now + 3 * 60 * 1_000_000_000);
+        assert_eq!(short[1], now + 12 * hour, "the next slot stays intraday");
+
+        // A minute is the floor: nothing is listed with an expiry already gone
+        // by the time the operator reads it.
+        assert!(schedule(now, 0)[0] > now);
     }
 
     #[test]
@@ -701,9 +736,13 @@ mod tests {
     #[test]
     fn routes_name_the_page_and_the_asset() {
         assert_eq!(route("/health"), Route::Health);
-        assert_eq!(route("/state"), Route::State(Asset::Eth));
-        assert_eq!(route("/state?asset=BTC"), Route::State(Asset::Btc));
-        assert_eq!(route("/state?asset=btc&expiry_ns=1"), Route::State(Asset::Btc));
+        assert_eq!(route("/state"), Route::State(Asset::Eth, None));
+        assert_eq!(route("/state?asset=BTC"), Route::State(Asset::Btc, None));
+        assert_eq!(
+            route("/state?asset=btc&expiry_ns=1"),
+            Route::State(Asset::Btc, Some(1)),
+            "a state read can name the expiry it is about"
+        );
         assert_eq!(route("/plan?asset=ETH&expiry_ns=12345"), Route::Plan(Asset::Eth, 12345));
         assert_eq!(route("/plan"), Route::Unknown, "a plan without an expiry is not a request");
         assert_eq!(route("/index?asset=BTC"), Route::Index(Asset::Btc, SCALE));

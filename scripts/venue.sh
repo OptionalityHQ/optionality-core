@@ -17,7 +17,7 @@ GATEWAY_PORT=${GATEWAY_PORT:-8790}
 ASSETS=${ASSETS:-ETH,BTC}
 EXPIRY_HOURS=${EXPIRY_HOURS:-1}
 TICK_SECS=${TICK_SECS:-4}
-LIST_SECS=${LIST_SECS:-60}
+LIST_SECS=${LIST_SECS:-30}
 SESSION=${SESSION:-data/chain-session.json}
 LOGS=logs
 
@@ -72,7 +72,9 @@ echo "booting the sandbox and listing the engine's ladder (watch $LOGS/host.log)
 # budget is reported rather than papered over, because a gateway pointed at a stale
 # session serves a screen that looks alive and reverts every trade it plans.
 ready=no
-for _ in $(seq 1 120); do
+# A week of ladders is five hundred series to commit before the session exists,
+# so the budget is minutes rather than seconds.
+for _ in $(seq 1 300); do
   grep -q "session written" "$LOGS/host.log" 2>/dev/null && { ready=yes; break; }
   sleep 2
 done

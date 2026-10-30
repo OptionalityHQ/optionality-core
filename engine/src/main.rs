@@ -29,11 +29,10 @@ use engine::serve::{self, Route, Tape, Venue};
 struct Config {
     port: u16,
     assets: Vec<Asset>,
+    /// The nearest expiry the venue lists. Everything after it comes from the
+    /// schedule, so a three-minute tenor is a demo knob and a four-hour one is
+    /// the day it ships with.
     expiry_hours: f64,
-    /// How long before the ladder's expiry the engine starts naming the next
-    /// one. The operator lists a fresh set of series on this signal, so the gap
-    /// it covers has to be longer than a listing run.
-    roll_lead_ns: u64,
     venue: Venue,
     replay: Option<PathBuf>,
     no_feed: bool,
@@ -72,12 +71,8 @@ fn parse(args: &[String]) -> Config {
         assets,
         expiry_hours: flag_value(args, "--expiry-hours")
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.0),
-        roll_lead_ns: flag_value(args, "--roll-lead-secs")
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .unwrap_or(600)
-            * 1_000_000_000,
+            .filter(|hours| *hours > 0.0)
+            .unwrap_or(4.0),
         venue,
         replay: flag_value(args, "--replay").map(PathBuf::from),
         no_feed: args.iter().any(|a| a == "--no-feed"),
@@ -129,7 +124,7 @@ fn respond(stream: &mut TcpStream, body: &str, status: &str) {
 
 /// One request, one answer. Sequential is enough: a GET here is a few kilobytes
 /// of numbers and the venue has one screen and one gateway pointed at it.
-fn handle(stream: &mut TcpStream, tape: &Arc<Mutex<Tape>>, config: &Config, expiry_ns: u64) {
+fn handle(stream: &mut TcpStream, tape: &Arc<Mutex<Tape>>, config: &Config, expiries: &[u64]) {
     let Ok(mut peer) = stream.try_clone() else { return };
     let mut reader = BufReader::new(&mut peer);
     let mut request_line = String::new();
@@ -157,10 +152,14 @@ fn handle(stream: &mut TcpStream, tape: &Arc<Mutex<Tape>>, config: &Config, expi
         // float is no longer the expiry the chain stored.
         Route::Health => {
             let (ticks, reconnects, sockets) = config.counts.snapshot();
+            let upcoming = serve::upcoming(expiries, now_ns());
             let body = serde_json::json!({
                 "ok": true,
                 "engine": "bounded-options",
-                "expiryNs": expiry_ns,
+                // The nearest expiry stays at the top level for callers that only
+                // want one, and the whole ladder is listed beside it.
+                "expiryNs": upcoming[0],
+                "expiries": upcoming,
                 "assets": config
                     .assets
                     .iter()
@@ -173,7 +172,8 @@ fn handle(stream: &mut TcpStream, tape: &Arc<Mutex<Tape>>, config: &Config, expi
             });
             respond(stream, &body.to_string(), "200 OK");
         }
-        Route::State(asset) => {
+        Route::State(asset, wanted) => {
+            let expiry_ns = wanted.unwrap_or_else(|| serve::upcoming(expiries, now_ns())[0]);
             let (body, listed, summary) = {
                 let guard = tape.lock().expect("the tape is only held while copying prints out of it");
                 let summary = guard.summary(asset, now_ms(), &config.venue.stale);
@@ -247,22 +247,21 @@ fn println_if(enabled: bool, line: &str) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help") {
-        println!("engine [--port 8791] [--assets ETH,BTC] [--expiry-hours 1] [--vol 0.6]");
+        println!("engine [--port 8791] [--assets ETH,BTC] [--expiry-hours 4] [--vol 0.6]");
         println!("       [--margin 400] [--impact 1000] [--replay file.jsonl | --no-feed]");
         println!("       [--quiet]   GET /health /state?asset= /plan?asset=&expiry_ns=");
         return Ok(());
     }
     let config = parse(&args);
-    let tenor_ns = (config.expiry_hours * 3_600_000_000_000.0) as u64;
-    let lead_ns = config.roll_lead_ns;
-    let mut expiry_ns = now_ns() + tenor_ns;
+    let near_ns = (config.expiry_hours * 3_600_000_000_000.0) as u64;
+    let expiries = serve::schedule(now_ns(), near_ns);
     let tape = Arc::new(Mutex::new(Tape::default()));
     let running = Arc::new(AtomicBool::new(true));
 
     println_if(
         !config.quiet,
         &format!(
-            "bounded engine · port {} · assets {} · expiry in {} h · vol {} · margin {} bps · impact {} bps",
+            "bounded engine · port {} · assets {} · {} expiries (near {} h) · vol {} · margin {} bps · impact {} bps",
             config.port,
             config
                 .assets
@@ -270,6 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|a| a.symbol())
                 .collect::<Vec<_>>()
                 .join(","),
+            expiries.len(),
             config.expiry_hours,
             config.venue.atm_vol,
             config.venue.terms.margin_bps,
@@ -291,11 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println_if(!config.quiet, &format!("listening  http://127.0.0.1:{}", config.port));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        // Rolled before it is asked for, so every route in one request agrees on
-        // the same ladder: the operator reads `/health` to learn the expiry and
-        // then asks for that expiry's plan and marks.
-        expiry_ns = serve::roll_expiry(expiry_ns, now_ns(), tenor_ns, lead_ns);
-        handle(&mut stream, &tape, &config, expiry_ns);
+        handle(&mut stream, &tape, &config, &expiries);
     }
     running.store(false, Ordering::Relaxed);
     Ok(())
