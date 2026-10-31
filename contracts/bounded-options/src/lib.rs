@@ -153,6 +153,9 @@ pub struct Ticket {
     /// margin can change between entry and settlement, and a settlement must
     /// unwind exactly the split that was made.
     pub venue_cut: u128,
+    /// Held to expiry: the buyer paid the mid with no venue margin and gave up
+    /// the right to leave. See `pool_buy_held`.
+    pub held: bool,
 }
 
 /// A resting bid: someone willing to BUY a protection ticket at `premium`,
@@ -193,6 +196,8 @@ pub struct PositionView {
     /// Who signed the price a finished ticket paid out on. Empty while the
     /// series is still open.
     pub settle_sources: Vec<String>,
+    /// Held to expiry: no fee was charged and the row cannot be closed.
+    pub held: bool,
 }
 
 #[near(serializers = [json])]
@@ -1056,6 +1061,7 @@ impl Contract {
                 premium: bid.premium,
                 cost: bid.premium,
                 venue_cut: 0,
+                held: false,
             },
         );
         self.note_ticket(&bid.owner, ticket_id);
@@ -1132,6 +1138,7 @@ impl Contract {
                 premium: offer.premium,
                 cost: offer.premium,
                 venue_cut: 0,
+                held: false,
             },
         );
         self.note_ticket(&buyer, ticket_id);
@@ -1175,6 +1182,34 @@ impl Contract {
         quantity: U128,
         max_total_premium: U128,
     ) -> u64 {
+        self.buy_from_pool(series_id, quantity, max_total_premium, false)
+    }
+
+    /// Buy from the vault and commit to hold to expiry — at the mid, with no
+    /// venue margin at all.
+    ///
+    /// This is the trade the product is willing to make with a holder who will
+    /// not cut and run: no fee in exchange for no exit. The holder gives up the
+    /// right to close early or sell into a bid, which is the option the margin
+    /// was charging for; the pool gives up its fee but also stops facing
+    /// early-exit flow. Settlement at expiry is unchanged — the payoff, not a
+    /// haircut.
+    pub fn pool_buy_held(
+        &mut self,
+        series_id: u64,
+        quantity: U128,
+        max_total_premium: U128,
+    ) -> u64 {
+        self.buy_from_pool(series_id, quantity, max_total_premium, true)
+    }
+
+    fn buy_from_pool(
+        &mut self,
+        series_id: u64,
+        quantity: U128,
+        max_total_premium: U128,
+        held: bool,
+    ) -> u64 {
         require!(!self.config.paused, "trading paused");
         require!(quantity.0 > 0, "quantity must be positive");
         require!(max_total_premium.0 > 0, "premium budget must be positive");
@@ -1198,7 +1233,10 @@ impl Contract {
             .expect("strike width");
         // The venue's number, or nothing: a caller cannot price the vault.
         let mid_units = self.live_quote(series_id);
-        let terms = self.terms();
+        // A held ticket pays the mid and keeps the right to nothing else. `FLAT`
+        // is the contract's own zero-fee policy, so there is no second fee path
+        // to audit: the same arithmetic, with the margin set to zero.
+        let terms = if held { fees::Terms::FLAT } else { self.terms() };
         let premium = terms
             .entry_premium(quantity.0, mid_units, series.price_scale)
             .expect("premium overflow");
@@ -1247,6 +1285,7 @@ impl Contract {
                 premium,
                 cost: premium,
                 venue_cut,
+                held,
             },
         );
         self.note_ticket(&buyer, ticket_id);
@@ -1285,6 +1324,10 @@ impl Contract {
             "not a pool ticket"
         );
         require!(ticket.buyer == seller, "only the buyer can close a ticket");
+        require!(
+            !ticket.held,
+            "a ticket held to expiry cannot be sold back"
+        );
         let series = self
             .series
             .get(&ticket.series_id)
@@ -1645,6 +1688,10 @@ impl Contract {
         let now = env::block_timestamp();
         let ticket = self.tickets.get(&ticket_id).expect("ticket not found").clone();
         require!(ticket.buyer == seller, "only the buyer can close a ticket");
+        require!(
+            !ticket.held,
+            "a ticket held to expiry cannot be sold on"
+        );
         let series = self
             .series
             .get(&ticket.series_id)
@@ -1738,6 +1785,7 @@ impl Contract {
                         _ => None,
                     },
                     settle_sources: series.settle_sources.clone(),
+                    held: ticket.held,
                 })
             })
             .collect::<Vec<_>>();
@@ -2099,6 +2147,7 @@ impl Contract {
                     premium: offer.premium,
                     cost: offer.premium,
                     venue_cut: 0,
+                    held: false,
                 },
             );
             self.note_ticket(&buyer, ticket_id);
@@ -2858,6 +2907,45 @@ mod tests {
             vec![1, 3]
         );
         assert_eq!(contract.expected_custody().0, 300 * SCALE);
+    }
+
+    #[test]
+    fn a_held_ticket_pays_the_mid_and_gives_up_the_exit() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 1_000 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
+
+        testing_env!(context(accounts(3), T0).build());
+        let ticket_id = contract.pool_buy_held(sid, U128(SCALE), U128(4 * SCALE));
+        let ticket = contract.get_ticket(ticket_id).unwrap();
+        // No venue margin at all: the holder pays the mid and the pool keeps it.
+        assert_eq!(ticket.premium, 3 * SCALE);
+        assert_eq!(ticket.venue_cut, 0);
+        assert!(ticket.held);
+        assert_eq!(contract.get_pool_state().venue_locked.0, 0);
+        // A plain purchase at the same mid still pays the venue's schedule.
+        assert!(entry_of(3) > 3 * SCALE, "the ordinary ticket is loaded");
+
+        // The commitment is the fee: neither exit leaves.
+        testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
+        assert!(refused(|| contract.pool_close(ticket_id, None)));
+        assert!(refused(|| contract.close_ticket(ticket_id, None)));
+        // And the ticket is still there, unclosed.
+        assert!(contract.get_ticket(ticket_id).is_some());
+
+        // Expiry is unchanged: the payoff, at the fixed price, with no haircut.
+        let mut fixed = contract.get_series(sid).unwrap();
+        fixed.settlement = Settlement::Fixed {
+            price: 95 * SCALE,
+            publish_time_ns: T0 + 60_000_000_000,
+        };
+        contract.series.insert(sid, fixed);
+        testing_env!(context(accounts(3), T0 + 700_000_000_000).build());
+        let (buyer, _) = contract.settle_ticket(ticket_id);
+        assert_eq!(buyer.0, 10 * SCALE, "the put pays its width less the two strikes");
+        assert!(contract.get_ticket(ticket_id).is_none());
     }
 
     #[test]
