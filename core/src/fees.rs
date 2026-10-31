@@ -38,10 +38,26 @@ pub struct Terms {
 }
 
 impl Terms {
-    /// Mid plus 4% to open, mid minus 10% to close early.
+    /// The contract's own default: mid plus 4% to open, mid minus 10% to close
+    /// early. It is deliberately the *prototype's* schedule — a venue sets its real
+    /// one at boot with `set_fee_terms`, which is what `venue.sh` does — and it
+    /// stays here because changing a default silently is how a contract starts
+    /// charging something nobody agreed to.
     pub const STANDARD: Terms = Terms {
         margin_bps: 400,
         impact_bps: 1_000,
+    };
+
+    /// The schedule the venue is booted with: mid plus half a percent to open, mid
+    /// minus one percent to close early.
+    ///
+    /// 400/1000 is not a fee, it is a 13.5% round trip on a mid of 0.10, and it was
+    /// the single number most likely to stop somebody trading. At 50/100 the round
+    /// trip is ~1.5% of the premium — 0.15% of the spread's width, which is what an
+    /// LP's capital is actually exposed to.
+    pub const VENUE: Terms = Terms {
+        margin_bps: 50,
+        impact_bps: 100,
     };
 
     /// Nothing charged, for the fixture series and anything quoted at model
@@ -103,21 +119,38 @@ mod tests {
 
     #[test]
     fn the_margin_lands_inside_the_premium() {
-        // 3 × 22.62 = 67.86 mid; plus 4% = 70.5744.
-        assert_eq!(
-            Terms::STANDARD.entry_premium(THREE, MID, SCALE).unwrap(),
-            70_574_400
-        );
-        assert_eq!(Terms::FLAT.entry_premium(THREE, MID, SCALE).unwrap(), 67_860_000);
+        // 3 × 22.62 = 67.86 mid, plus whatever the terms charge, rounded up.
+        let mid_total = THREE * MID / SCALE;
+        let numerator = mid_total * (BASIS + u128::from(Terms::STANDARD.margin_bps));
+        let loaded = (numerator + BASIS - 1) / BASIS;
+        assert_eq!(Terms::STANDARD.entry_premium(THREE, MID, SCALE).unwrap(), loaded, "rounded up");
+        assert_eq!(Terms::FLAT.entry_premium(THREE, MID, SCALE).unwrap(), mid_total);
     }
 
     #[test]
     fn the_premium_splits_into_the_two_shares_exactly() {
         let premium = Terms::STANDARD.entry_premium(THREE, MID, SCALE).unwrap();
-        assert_eq!(Terms::STANDARD.venue_cut(premium).unwrap(), 2_714_400);
-        // The pool's share is the mid it would have charged with no margin, so
-        // the venue takes the uplift and nothing else.
-        assert_eq!(Terms::STANDARD.lp_notional(premium).unwrap(), 67_860_000);
+        let lift = premium - Terms::STANDARD.lp_notional(premium).unwrap();
+        assert_eq!(Terms::STANDARD.venue_cut(premium).unwrap(), lift, "the venue takes the uplift and nothing else");
+        // The pool's share is the mid it would have charged with no margin.
+        assert_eq!(Terms::STANDARD.lp_notional(premium).unwrap(), THREE * MID / SCALE);
+    }
+
+    #[test]
+    fn the_venue_schedule_is_a_round_trip_worth_trading() {
+        // The number that decides whether anyone trades: what a round trip costs as
+        // a share of the premium. The prototype charged 13.5%.
+        let mid = 100_000u128; // 0.10 per contract
+        let entry = Terms::VENUE.entry_premium(SCALE, mid, SCALE).unwrap();
+        let exit = Terms::VENUE.exit_value(SCALE, mid, SCALE).unwrap();
+        let round_trip_bps = (entry - exit) * BASIS / mid;
+        assert!(round_trip_bps <= 200, "a round trip costs {round_trip_bps} bps of the premium");
+        // Against the width an LP actually risks — a 100-point spread — the same
+        // round trip is well under a basis point.
+        let width = 100 * SCALE;
+        assert!((entry - exit) * BASIS / width <= 1, "under a basis point of the width");
+        assert_eq!((Terms::VENUE.margin_bps, Terms::VENUE.impact_bps), (50, 100));
+        assert_eq!((Terms::STANDARD.margin_bps, Terms::STANDARD.impact_bps), (400, 1_000), "the contract default is unchanged");
     }
 
     #[test]
@@ -136,10 +169,9 @@ mod tests {
 
     #[test]
     fn closing_early_pays_the_haircut_and_never_more_than_mid() {
-        assert_eq!(
-            Terms::STANDARD.exit_value(THREE, MID, SCALE).unwrap(),
-            61_074_000
-        );
+        let mid_total = THREE * MID / SCALE;
+        let haircut = mid_total * (BASIS - u128::from(Terms::STANDARD.impact_bps)) / BASIS;
+        assert_eq!(Terms::STANDARD.exit_value(THREE, MID, SCALE).unwrap(), haircut);
         let mid_total = THREE * MID / SCALE;
         assert_eq!(Terms::FLAT.exit_value(THREE, MID, SCALE).unwrap(), mid_total);
         assert!(Terms::STANDARD.exit_value(THREE, MID, SCALE).unwrap() < mid_total);

@@ -24,6 +24,10 @@ LIST_SECS=${LIST_SECS:-30}
 MAKER_ROLE=${MAKER_ROLE:-maker-1}
 # One seeded taker, so the tape moves without a visitor having to click.
 ACTIVITY_ROLE=${ACTIVITY_ROLE:-taker-1}
+# What the venue charges: 0.5% over mid to open, 1% under mid to close. The
+# contract default is the prototype's 4%/10%; the venue sets its schedule here.
+MARGIN_BPS=${MARGIN_BPS:-50}
+IMPACT_BPS=${IMPACT_BPS:-100}
 SESSION=${SESSION:-data/chain-session.json}
 LOGS=logs
 
@@ -69,7 +73,8 @@ sleep 2
 
 nohup ./target/debug/chain-host --out "$SESSION" \
   --engine "http://127.0.0.1:$ENGINE_PORT" --assets "$ASSETS" \
-  --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" --maker "$MAKER_ROLE" --activity "$ACTIVITY_ROLE" > "$LOGS/host.log" 2>&1 &
+  --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" --maker "$MAKER_ROLE" --activity "$ACTIVITY_ROLE" \
+  --margin-bps "$MARGIN_BPS" --impact-bps "$IMPACT_BPS" > "$LOGS/host.log" 2>&1 &
 
 echo "booting the sandbox and listing the engine's ladder (watch $LOGS/host.log)…"
 # The gate is the session file being *written*, not the ladder being listed: the

@@ -2458,6 +2458,19 @@ mod tests {
         contract.pool_sweep().0
     }
 
+    /// What the venue charges one contract at `mid` tokens, under the contract's
+    /// own terms — so a fee change moves these tests with it instead of leaving a
+    /// number that was true the day they were written.
+    fn entry_of(mid: u128) -> u128 {
+        fees::Terms::STANDARD.entry_premium(SCALE, mid * SCALE, SCALE).unwrap()
+    }
+    fn cut_of(mid: u128) -> u128 {
+        fees::Terms::STANDARD.venue_cut(entry_of(mid)).unwrap()
+    }
+    fn exit_of(mid: u128) -> u128 {
+        fees::Terms::STANDARD.exit_value(SCALE, mid * SCALE, SCALE).unwrap()
+    }
+
     fn series(contract: &mut Contract) -> u64 {
         testing_env!(context(accounts(0), T0).build());
         contract.create_series(
@@ -3356,7 +3369,7 @@ mod tests {
 
         let vault = contract.get_pool_state();
         assert_eq!(vault.equity.0, 23 * SCALE, "the mid joins equity");
-        assert_eq!(vault.venue_locked.0, 120_000, "the margin does not");
+        assert_eq!(vault.venue_locked.0, cut_of(3), "the margin does not");
         assert_eq!(vault.venue.0, 0);
         assert_eq!(vault.reserved.0, 7 * SCALE, "10 worst case less the 3 kept");
         assert_eq!(vault.free_equity.0, 16 * SCALE);
@@ -3478,7 +3491,7 @@ mod tests {
         assert_eq!(vault.equity.0, 13 * SCALE, "20 principal plus 3 kept minus 10 paid");
         assert_eq!(vault.reserved.0, 0);
         assert_eq!(vault.venue_locked.0, 0);
-        assert_eq!(vault.venue.0, 120_000, "the ticket can no longer be voided");
+        assert_eq!(vault.venue.0, cut_of(3), "the ticket can no longer be voided");
         assert_eq!(vault.open_tickets, 0);
         assert_eq!(contract.get_balance(accounts(3)).0, 106_880_000);
         assert_eq!(contract.stats().open_ticket_count, 0);
@@ -3563,7 +3576,7 @@ mod tests {
         // The venue can ask, but an open ticket still owns that margin: a void
         // would have nothing to refund from.
         assert_eq!(sweep(&mut contract), 0);
-        assert_eq!(contract.get_pool_state().venue_locked.0, 120_000);
+        assert_eq!(contract.get_pool_state().venue_locked.0, cut_of(3));
         assert_eq!(contract.get_balance(accounts(0)).0, 0);
 
         // Hand the position back early and the same slice becomes takeable.
@@ -3593,7 +3606,7 @@ mod tests {
         quote(&mut contract, sid, 2 * SCALE);
         testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
         let exit = contract.pool_close(ticket, None);
-        assert_eq!(exit.0, 1_800_000);
+        assert_eq!(exit.0, exit_of(2));
         assert!(contract.get_ticket(ticket).is_none(), "the position is gone");
         assert!(contract.get_positions(accounts(3), 10).is_empty());
         assert_eq!(contract.get_pool_state().reserved.0, 0);
@@ -3627,7 +3640,7 @@ mod tests {
         testing_env!(context(outsider(), T0 + 700_000_000_000).build());
         contract.void_series(sid);
         let (buyer, maker) = contract.settle_ticket(ticket);
-        assert_eq!(buyer.0, 3_120_000, "everything the buyer paid comes back");
+        assert_eq!(buyer.0, entry_of(3), "everything the buyer paid comes back");
         assert_eq!(maker.0, 0);
         assert_eq!(contract.get_balance(accounts(3)).0, 100 * SCALE);
 
@@ -3686,7 +3699,7 @@ mod tests {
         assert_eq!(contract.get_pool_state().reserved.0, 0);
         testing_env!(context(accounts(5), T0).build());
         assert_eq!(contract.pool_withdraw(U128(shares)).0, 16 * SCALE);
-        assert_eq!(sweep(&mut contract), 240_000);
+        assert_eq!(sweep(&mut contract), 2 * cut_of(3));
         assert_eq!(contract.expected_custody().0, 110 * SCALE);
     }
 
@@ -3713,8 +3726,8 @@ mod tests {
         let moved = contract.get_ticket(ticket).unwrap();
         assert_eq!(moved.buyer, accounts(4));
         assert_eq!(moved.maker, vault_account(), "the vault still owes the payoff");
-        assert_eq!(moved.premium, 3_120_000, "the entry the vault made is unchanged");
-        assert_eq!(moved.venue_cut, 120_000);
+        assert_eq!(moved.premium, entry_of(3), "the entry the vault made is unchanged");
+        assert_eq!(moved.venue_cut, cut_of(3));
         assert_eq!(moved.cost, 3 * SCALE, "the new holder's basis is their price");
         assert_eq!(contract.get_pool_state().reserved.0, 7 * SCALE);
         assert_eq!(contract.expected_custody().0, 220 * SCALE);
@@ -3774,7 +3787,7 @@ mod tests {
         let exit = contract.pool_close(ticket, None);
         assert_eq!(exit.0, 2_400_000);
         assert_eq!(contract.expected_custody().0, 1_100 * SCALE);
-        assert_eq!(sweep(&mut contract), 240_000);
+        assert_eq!(sweep(&mut contract), 2 * cut_of(3));
     }
 
     #[test]
@@ -3933,7 +3946,7 @@ mod tests {
 
         testing_env!(context(accounts(3), T0).build());
         let seen = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
-        assert_eq!(contract.get_ticket(seen).unwrap().premium, 3_120_000);
+        assert_eq!(contract.get_ticket(seen).unwrap().premium, entry_of(3));
 
         // The index moves and the venue re-prices before the next click lands.
         quote(&mut contract, sid, 6 * SCALE);
@@ -4002,9 +4015,9 @@ mod tests {
         let p = &prices[0];
         assert_eq!(p.series_id, sid);
         assert_eq!(p.mid_units.0, 3 * SCALE);
-        // Two contracts at 3.00 with a 4% margin: 6.24 in, 90% of 6.00 back.
-        assert_eq!(p.entry_units.0, 6_240_000);
-        assert_eq!(p.exit_units.0, 5_400_000);
+        // Two contracts at 3.00, at whatever the contract's own terms charge.
+        assert_eq!(p.entry_units.0, 2 * entry_of(3));
+        assert_eq!(p.exit_units.0, 2 * exit_of(3));
         assert_eq!(p.age_ns, 0);
         assert!(p.exit_units.0 < p.entry_units.0, "a round trip is never free");
 

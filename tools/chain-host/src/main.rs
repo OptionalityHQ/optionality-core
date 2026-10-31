@@ -670,6 +670,27 @@ async fn main() -> Result<()> {
         .transact()
         .await?
         .into_result()?;
+    // The schedule the venue trades on. The contract's own default is the
+    // prototype's 400/1000; a venue sets its real one here, in one place, and the
+    // log records it so nobody has to read the code to find out what it charges.
+    let margin_bps: u32 = arg("--margin-bps", &bounded_core::fees::Terms::VENUE.margin_bps.to_string())
+        .parse()
+        .context("--margin-bps must be a number")?;
+    let impact_bps: u32 = arg("--impact-bps", &bounded_core::fees::Terms::VENUE.impact_bps.to_string())
+        .parse()
+        .context("--impact-bps must be a number")?;
+    admin
+        .call(options.id(), "set_fee_terms")
+        .args_json(json!({ "margin_bps": margin_bps, "impact_bps": impact_bps }))
+        .gas(GAS)
+        .transact()
+        .await?
+        .into_result()?;
+    println!(
+        "fee schedule: {:.2}% over mid to open, {:.2}% under mid to close early",
+        margin_bps as f64 / 100.0,
+        impact_bps as f64 / 100.0
+    );
 
     // The contract needs its own storage slot on the token before it can accept
     // a deposit, and the admin pays for it once.
