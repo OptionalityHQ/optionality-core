@@ -28,10 +28,14 @@ pub enum Action {
     Post { series_id: u64, premium_units: u128 },
 }
 
-/// How far the model's mid the maker rests. Twenty percent of a spread's mid is
-/// wide on purpose: a maker that quotes like the vault is a maker nobody needs,
-/// and one that quotes tighter is a maker whose fills are all adverse selection.
-pub const EDGE_BPS: u128 = 200;
+/// How far over the model's mid the maker rests.
+///
+/// It has to sit *inside* the venue's own entry (the contract's margin, 50 bps at
+/// boot) or the ladder will always prefer the vault and the book is decoration —
+/// which is exactly what happened when the fee dropped from 400 to 50 and this
+/// stayed at 200. Twenty bps keeps it a genuine maker with a spread, and the first
+/// one on the book.
+pub const EDGE_BPS: u128 = 20;
 
 /// The cell a series occupies: a put is struck at its high leg and a call at its
 /// low one. This is the same rule the gateway addresses cells with, and the two
@@ -191,7 +195,7 @@ mod tests {
         assert_eq!(wants.len(), 2, "one put and one call, no more");
         assert_eq!(wants[0].series_id, 2, "the 2300/2400 put");
         assert_eq!(wants[1].series_id, 3, "the 2400/2500 call, not next week's");
-        assert_eq!(wants[1].premium_units, 70_000 + 70_000 * 200 / 10_000, "the model's mid plus the edge");
+        assert_eq!(wants[1].premium_units, 70_000 + 70_000 * 20 / 10_000, "the model's mid plus the edge");
     }
 
     #[test]
@@ -208,6 +212,17 @@ mod tests {
         let plans = vec![plan_row("Call", 3_000, 3_100, 5)];
         let rows = vec![row(1, "Call", 2_400, 2_500, EXPIRY)];
         assert!(wants(2_450, &plans, &rows, EXPIRY).is_empty(), "no series, no quote");
+    }
+
+    #[test]
+    fn the_maker_quotes_inside_the_venue_so_the_book_can_win() {
+        // The venue's entry is mid × (1 + margin). A maker priced above that is
+        // never the best ask, which makes the whole book decorative.
+        let venue_entry_bps = 50u128;
+        assert!(
+            EDGE_BPS < venue_entry_bps,
+            "a maker at {EDGE_BPS} bps is wider than the venue at {venue_entry_bps}"
+        );
     }
 
     #[test]
