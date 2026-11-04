@@ -1,0 +1,2098 @@
+{
+  "comment": "Trade vectors from bounded-core, consumed by the TypeScript order planner.",
+  "generated_by": "core/tests/vectors.rs",
+  "rows": [
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "0",
+      "entry_units": "1000000",
+      "exit_units": "1000000",
+      "hold_entry_units": "1000000",
+      "impact_bps": 0,
+      "lp_units": "1000000",
+      "margin_bps": 0,
+      "max_payout_units": "100000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "5000",
+      "entry_units": "1005000",
+      "exit_units": "990000",
+      "hold_entry_units": "1000000",
+      "impact_bps": 100,
+      "lp_units": "1000000",
+      "margin_bps": 50,
+      "max_payout_units": "100000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "40000",
+      "entry_units": "1040000",
+      "exit_units": "900000",
+      "hold_entry_units": "1000000",
+      "impact_bps": 1000,
+      "lp_units": "1000000",
+      "margin_bps": 400,
+      "max_payout_units": "100000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "0",
+      "entry_units": "5000000",
+      "exit_units": "5000000",
+      "hold_entry_units": "5000000",
+      "impact_bps": 0,
+      "lp_units": "5000000",
+      "margin_bps": 0,
+      "max_payout_units": "100000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "25000",
+      "entry_units": "5025000",
+      "exit_units": "4950000",
+      "hold_entry_units": "5000000",
+      "impact_bps": 100,
+      "lp_units": "5000000",
+      "margin_bps": 50,
+      "max_payout_units": "100000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "200000",
+      "entry_units": "5200000",
+      "exit_units": "4500000",
+      "hold_entry_units": "5000000",
+      "impact_bps": 1000,
+      "lp_units": "5000000",
+      "margin_bps": 400,
+      "max_payout_units": "100000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "0",
+      "entry_units": "22000000",
+      "exit_units": "22000000",
+      "hold_entry_units": "22000000",
+      "impact_bps": 0,
+      "lp_units": "22000000",
+      "margin_bps": 0,
+      "max_payout_units": "100000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "110000",
+      "entry_units": "22110000",
+      "exit_units": "21780000",
+      "hold_entry_units": "22000000",
+      "impact_bps": 100,
+      "lp_units": "22000000",
+      "margin_bps": 50,
+      "max_payout_units": "100000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "880000",
+      "entry_units": "22880000",
+      "exit_units": "19800000",
+      "hold_entry_units": "22000000",
+      "impact_bps": 1000,
+      "lp_units": "22000000",
+      "margin_bps": 400,
+      "max_payout_units": "100000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "0",
+      "entry_units": "95000000",
+      "exit_units": "95000000",
+      "hold_entry_units": "95000000",
+      "impact_bps": 0,
+      "lp_units": "95000000",
+      "margin_bps": 0,
+      "max_payout_units": "100000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "475000",
+      "entry_units": "95475000",
+      "exit_units": "94050000",
+      "hold_entry_units": "95000000",
+      "impact_bps": 100,
+      "lp_units": "95000000",
+      "margin_bps": 50,
+      "max_payout_units": "100000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "10000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 1,
+      "cut_units": "3800000",
+      "entry_units": "98800000",
+      "exit_units": "85500000",
+      "hold_entry_units": "95000000",
+      "impact_bps": 1000,
+      "lp_units": "95000000",
+      "margin_bps": 400,
+      "max_payout_units": "100000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "100000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "90000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "1000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "0",
+      "entry_units": "3000000",
+      "exit_units": "3000000",
+      "hold_entry_units": "3000000",
+      "impact_bps": 0,
+      "lp_units": "3000000",
+      "margin_bps": 0,
+      "max_payout_units": "300000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "15000",
+      "entry_units": "3015000",
+      "exit_units": "2970000",
+      "hold_entry_units": "3000000",
+      "impact_bps": 100,
+      "lp_units": "3000000",
+      "margin_bps": 50,
+      "max_payout_units": "300000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "120000",
+      "entry_units": "3120000",
+      "exit_units": "2700000",
+      "hold_entry_units": "3000000",
+      "impact_bps": 1000,
+      "lp_units": "3000000",
+      "margin_bps": 400,
+      "max_payout_units": "300000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "0",
+      "entry_units": "15000000",
+      "exit_units": "15000000",
+      "hold_entry_units": "15000000",
+      "impact_bps": 0,
+      "lp_units": "15000000",
+      "margin_bps": 0,
+      "max_payout_units": "300000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "75000",
+      "entry_units": "15075000",
+      "exit_units": "14850000",
+      "hold_entry_units": "15000000",
+      "impact_bps": 100,
+      "lp_units": "15000000",
+      "margin_bps": 50,
+      "max_payout_units": "300000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "600000",
+      "entry_units": "15600000",
+      "exit_units": "13500000",
+      "hold_entry_units": "15000000",
+      "impact_bps": 1000,
+      "lp_units": "15000000",
+      "margin_bps": 400,
+      "max_payout_units": "300000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "0",
+      "entry_units": "66000000",
+      "exit_units": "66000000",
+      "hold_entry_units": "66000000",
+      "impact_bps": 0,
+      "lp_units": "66000000",
+      "margin_bps": 0,
+      "max_payout_units": "300000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "330000",
+      "entry_units": "66330000",
+      "exit_units": "65340000",
+      "hold_entry_units": "66000000",
+      "impact_bps": 100,
+      "lp_units": "66000000",
+      "margin_bps": 50,
+      "max_payout_units": "300000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "2640000",
+      "entry_units": "68640000",
+      "exit_units": "59400000",
+      "hold_entry_units": "66000000",
+      "impact_bps": 1000,
+      "lp_units": "66000000",
+      "margin_bps": 400,
+      "max_payout_units": "300000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "0",
+      "entry_units": "285000000",
+      "exit_units": "285000000",
+      "hold_entry_units": "285000000",
+      "impact_bps": 0,
+      "lp_units": "285000000",
+      "margin_bps": 0,
+      "max_payout_units": "300000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "1425000",
+      "entry_units": "286425000",
+      "exit_units": "282150000",
+      "hold_entry_units": "285000000",
+      "impact_bps": 100,
+      "lp_units": "285000000",
+      "margin_bps": 50,
+      "max_payout_units": "300000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "30000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 3,
+      "cut_units": "11400000",
+      "entry_units": "296400000",
+      "exit_units": "256500000",
+      "hold_entry_units": "285000000",
+      "impact_bps": 1000,
+      "lp_units": "285000000",
+      "margin_bps": 400,
+      "max_payout_units": "300000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "300000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "300000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "270000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "3000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "0",
+      "entry_units": "10000000",
+      "exit_units": "10000000",
+      "hold_entry_units": "10000000",
+      "impact_bps": 0,
+      "lp_units": "10000000",
+      "margin_bps": 0,
+      "max_payout_units": "1000000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "50000",
+      "entry_units": "10050000",
+      "exit_units": "9900000",
+      "hold_entry_units": "10000000",
+      "impact_bps": 100,
+      "lp_units": "10000000",
+      "margin_bps": 50,
+      "max_payout_units": "1000000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "400000",
+      "entry_units": "10400000",
+      "exit_units": "9000000",
+      "hold_entry_units": "10000000",
+      "impact_bps": 1000,
+      "lp_units": "10000000",
+      "margin_bps": 400,
+      "max_payout_units": "1000000000",
+      "mid_units": "1000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "0",
+      "entry_units": "50000000",
+      "exit_units": "50000000",
+      "hold_entry_units": "50000000",
+      "impact_bps": 0,
+      "lp_units": "50000000",
+      "margin_bps": 0,
+      "max_payout_units": "1000000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "250000",
+      "entry_units": "50250000",
+      "exit_units": "49500000",
+      "hold_entry_units": "50000000",
+      "impact_bps": 100,
+      "lp_units": "50000000",
+      "margin_bps": 50,
+      "max_payout_units": "1000000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "2000000",
+      "entry_units": "52000000",
+      "exit_units": "45000000",
+      "hold_entry_units": "50000000",
+      "impact_bps": 1000,
+      "lp_units": "50000000",
+      "margin_bps": 400,
+      "max_payout_units": "1000000000",
+      "mid_units": "5000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "0",
+      "entry_units": "220000000",
+      "exit_units": "220000000",
+      "hold_entry_units": "220000000",
+      "impact_bps": 0,
+      "lp_units": "220000000",
+      "margin_bps": 0,
+      "max_payout_units": "1000000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "1100000",
+      "entry_units": "221100000",
+      "exit_units": "217800000",
+      "hold_entry_units": "220000000",
+      "impact_bps": 100,
+      "lp_units": "220000000",
+      "margin_bps": 50,
+      "max_payout_units": "1000000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "8800000",
+      "entry_units": "228800000",
+      "exit_units": "198000000",
+      "hold_entry_units": "220000000",
+      "impact_bps": 1000,
+      "lp_units": "220000000",
+      "margin_bps": 400,
+      "max_payout_units": "1000000000",
+      "mid_units": "22000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "0",
+      "entry_units": "950000000",
+      "exit_units": "950000000",
+      "hold_entry_units": "950000000",
+      "impact_bps": 0,
+      "lp_units": "950000000",
+      "margin_bps": 0,
+      "max_payout_units": "1000000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "4750000",
+      "entry_units": "954750000",
+      "exit_units": "940500000",
+      "hold_entry_units": "950000000",
+      "impact_bps": 100,
+      "lp_units": "950000000",
+      "margin_bps": 50,
+      "max_payout_units": "1000000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    },
+    {
+      "call_payouts": [
+        {
+          "payout_units": "0",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "100000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "220000000"
+        }
+      ],
+      "contracts": 10,
+      "cut_units": "38000000",
+      "entry_units": "988000000",
+      "exit_units": "855000000",
+      "hold_entry_units": "950000000",
+      "impact_bps": 1000,
+      "lp_units": "950000000",
+      "margin_bps": 400,
+      "max_payout_units": "1000000000",
+      "mid_units": "95000000",
+      "put_payouts": [
+        {
+          "payout_units": "1000000000",
+          "price_units": "0"
+        },
+        {
+          "payout_units": "1000000000",
+          "price_units": "90000000"
+        },
+        {
+          "payout_units": "900000000",
+          "price_units": "110000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "200000000"
+        },
+        {
+          "payout_units": "0",
+          "price_units": "220000000"
+        }
+      ],
+      "quantity_units": "10000000",
+      "scale": "1000000"
+    }
+  ],
+  "strikes": {
+    "high": "200",
+    "low": "100"
+  }
+}

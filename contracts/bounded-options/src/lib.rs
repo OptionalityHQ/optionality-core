@@ -3459,9 +3459,13 @@ mod tests {
         assert_eq!(vault.equity.0, 23 * SCALE, "the mid joins equity");
         assert_eq!(vault.venue_locked.0, cut_of(3), "the margin does not");
         assert_eq!(vault.venue.0, 0);
-        assert_eq!(vault.reserved.0, 7 * SCALE, "10 worst case less the 3 kept");
-        assert_eq!(vault.free_equity.0, 16 * SCALE);
-        assert_eq!(vault.utilisation_bps.0, 3_043);
+        assert_eq!(
+            vault.reserved.0,
+            10 * SCALE,
+            "the full worst case is held, not just the net of the premium"
+        );
+        assert_eq!(vault.free_equity.0, 13 * SCALE);
+        assert_eq!(vault.utilisation_bps.0, 4_347);
         assert_eq!(vault.open_tickets, 1);
         assert_eq!(vault.margin_bps, 400);
 
@@ -3532,25 +3536,25 @@ mod tests {
         assert_eq!(contract.stats().open_ticket_count, 0);
         assert_eq!(contract.expected_custody().0, 2_000 * SCALE);
 
-        // Capacity: 10 of equity takes two of these and refuses the third,
-        // because the third worst case would outrun what the pool holds.
+        // Capacity: a ticket reserves its whole 10 worst case and brings in 3 of
+        // premium, so 14 of equity takes two of them and refuses the third.
         let mut tight = setup();
         let tid = series(&mut tight);
-        deposit_to_pool(&mut tight, accounts(5), 10 * SCALE);
+        deposit_to_pool(&mut tight, accounts(5), 14 * SCALE);
         fund(&mut tight, accounts(3), 100 * SCALE);
         buy_from(&mut tight, accounts(3), tid, 3 * SCALE, 10 * SCALE);
         buy_from(&mut tight, accounts(3), tid, 3 * SCALE, 10 * SCALE);
-        assert_eq!(tight.get_pool_state().equity.0, 16 * SCALE);
-        assert_eq!(tight.get_pool_state().reserved.0, 14 * SCALE);
-        assert_eq!(tight.get_pool_state().free_equity.0, 2 * SCALE);
-        assert_eq!(tight.get_pool_state().utilisation_bps.0, 8_750);
+        assert_eq!(tight.get_pool_state().equity.0, 20 * SCALE);
+        assert_eq!(tight.get_pool_state().reserved.0, 20 * SCALE);
+        assert_eq!(tight.get_pool_state().free_equity.0, 0);
+        assert_eq!(tight.get_pool_state().utilisation_bps.0, 10_000);
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             buy_from(&mut tight, accounts(3), tid, 3 * SCALE, 10 * SCALE)
         }))
         .is_err());
         assert_eq!(tight.get_pool_state().open_tickets, 2);
         assert_eq!(tight.get_balance(accounts(3)).0, 100 * SCALE - 6_240_000);
-        assert_eq!(tight.expected_custody().0, 110 * SCALE);
+        assert_eq!(tight.expected_custody().0, 114 * SCALE);
     }
 
     #[test]
@@ -3748,7 +3752,7 @@ mod tests {
     fn an_lp_cannot_leave_in_front_of_the_worst_case_the_pool_is_holding() {
         let mut contract = setup();
         let sid = series(&mut contract);
-        deposit_to_pool(&mut contract, accounts(5), 10 * SCALE);
+        deposit_to_pool(&mut contract, accounts(5), 14 * SCALE);
         fund(&mut contract, accounts(3), 100 * SCALE);
         let shares = contract.get_lp_shares(accounts(5)).0;
         let mut ticket = Vec::new();
@@ -3757,16 +3761,16 @@ mod tests {
             testing_env!(context(accounts(3), T0).build());
             ticket.push(contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE)));
         }
-        assert_eq!(contract.get_pool_state().free_equity.0, 2 * SCALE);
+        assert_eq!(contract.get_pool_state().free_equity.0, 0);
 
         testing_env!(context(accounts(5), T0).build());
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             contract.pool_withdraw(U128(shares))
         }))
         .is_err());
-        // Even the 2 of slack is not enough to cover a 14 reservation.
+        // Not even one share: the reservation is the whole open worst case.
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            contract.pool_withdraw(U128(2 * SCALE))
+            contract.pool_withdraw(U128(SCALE))
         }))
         .is_err());
         assert_eq!(contract.get_lp_shares(accounts(5)).0, shares);
@@ -3786,9 +3790,9 @@ mod tests {
         }
         assert_eq!(contract.get_pool_state().reserved.0, 0);
         testing_env!(context(accounts(5), T0).build());
-        assert_eq!(contract.pool_withdraw(U128(shares)).0, 16 * SCALE);
+        assert_eq!(contract.pool_withdraw(U128(shares)).0, 20 * SCALE);
         assert_eq!(sweep(&mut contract), 2 * cut_of(3));
-        assert_eq!(contract.expected_custody().0, 110 * SCALE);
+        assert_eq!(contract.expected_custody().0, 114 * SCALE);
     }
 
     #[test]
@@ -3817,7 +3821,11 @@ mod tests {
         assert_eq!(moved.premium, entry_of(3), "the entry the vault made is unchanged");
         assert_eq!(moved.venue_cut, cut_of(3));
         assert_eq!(moved.cost, 3 * SCALE, "the new holder's basis is their price");
-        assert_eq!(contract.get_pool_state().reserved.0, 7 * SCALE);
+        assert_eq!(
+            contract.get_pool_state().reserved.0,
+            10 * SCALE,
+            "the worst case moved with the ticket, not with the person"
+        );
         assert_eq!(contract.expected_custody().0, 220 * SCALE);
 
         let mut fixed = contract.get_series(sid).unwrap();
@@ -3868,7 +3876,7 @@ mod tests {
         assert_eq!(stored.venue_cut, 240_000);
         assert_eq!(stored.collateral, 10 * SCALE, "the risk is the same trade");
         assert_eq!(contract.get_pool_state().equity.0, 103 * SCALE);
-        assert_eq!(contract.get_pool_state().reserved.0, 7 * SCALE);
+        assert_eq!(contract.get_pool_state().reserved.0, 10 * SCALE);
 
         // Exiting at the same mid now gives back 80% of the mid.
         testing_env!(context(accounts(3), T0 + 1_000_000_000).build());
@@ -4199,6 +4207,607 @@ mod tests {
         assert!(
             !usable_fix(&fix(105 * SCALE, T0 + 61_000_000_000, 4_999, &["a", "b"]), &row, T0 + 62_000_000_000),
             "a committee that cannot agree to within the series' floor is not a price"
+        );
+    }
+
+    #[test]
+    fn a_ticket_settles_once_and_only_after_its_series_is_fixed() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
+        testing_env!(context(accounts(3), T0).build());
+        let ticket = contract.pool_buy(sid, U128(SCALE), U128(4 * SCALE));
+        let custody = contract.expected_custody().0;
+
+        // An open series has no price to pay against, and a refused settlement
+        // must not move a token.
+        testing_env!(context(outsider(), T0).build());
+        assert!(refused(|| contract.settle_ticket(ticket)));
+        assert_eq!(contract.expected_custody().0, custody);
+        assert!(contract.get_ticket(ticket).is_some());
+
+        let mut row = contract.get_series(sid).unwrap();
+        row.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0,
+        };
+        contract.series.insert(sid, row);
+        testing_env!(context(outsider(), T0).build());
+        let (buyer, maker) = contract.settle_ticket(ticket);
+        assert_eq!(buyer.0, 5 * SCALE);
+        assert_eq!(maker.0, 0, "the vault is the maker, so there is no second credit");
+        assert_eq!(contract.expected_custody().0, custody, "a payout moves money, it does not make it");
+
+        // Paid once, gone: no second settle, no early exit, no sale into a bid.
+        testing_env!(context(outsider(), T0).build());
+        assert!(refused(|| contract.settle_ticket(ticket)));
+        testing_env!(context(accounts(3), T0).build());
+        assert!(refused(|| contract.pool_close(ticket, None)));
+        assert!(refused(|| contract.close_ticket(ticket, None)));
+        assert_eq!(contract.get_balance(accounts(3)).0, 100 * SCALE - entry_of(3) + 5 * SCALE);
+        assert_eq!(contract.get_pool_state().open_tickets, 0);
+        assert_eq!(contract.get_pool_state().reserved.0, 0);
+    }
+
+    #[test]
+    fn a_series_is_either_fixed_or_voided_never_both() {
+        let mut contract = setup();
+        let fixed_sid = series(&mut contract);
+        let void_sid = series(&mut contract);
+        // Both are past their finalize deadline, so a void would otherwise be
+        // allowed on either of them.
+        testing_env!(context(accounts(0), T0 + 700_000_000_000).build());
+
+        let mut row = contract.get_series(fixed_sid).unwrap();
+        row.settlement = Settlement::Fixed {
+            price: 105 * SCALE,
+            publish_time_ns: T0 + 61_000_000_000,
+        };
+        contract.series.insert(fixed_sid, row);
+        testing_env!(context(accounts(0), T0 + 700_000_000_000).build());
+        assert!(refused(|| contract.void_series(fixed_sid)), "a fixed series is not voidable");
+
+        contract.void_series(void_sid);
+        testing_env!(context(accounts(0), T0 + 700_000_000_000).build());
+        assert!(refused(|| contract.void_series(void_sid)), "a void is final too");
+        let stored = contract.get_series(void_sid).unwrap();
+        assert!(matches!(stored.settlement, Settlement::Void));
+    }
+
+    #[test]
+    fn no_zero_or_overflowing_order_reaches_the_books() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        deposit_to_pool(&mut contract, accounts(5), 20 * SCALE);
+        fund(&mut contract, accounts(3), 100 * SCALE);
+        fund(&mut contract, accounts(4), 100 * SCALE);
+        quote(&mut contract, sid, 3 * SCALE);
+        let before = contract.expected_custody().0;
+
+        testing_env!(context(accounts(3), T0).build());
+        assert!(refused(|| contract.pool_buy(sid, U128(0), U128(4 * SCALE))));
+        assert!(refused(|| contract.pool_buy(sid, U128(SCALE), U128(0))));
+        assert!(refused(|| contract.pool_buy(sid, U128(u128::MAX), U128(u128::MAX))));
+        assert!(refused(|| contract.pool_buy_held(sid, U128(0), U128(4 * SCALE))));
+
+        testing_env!(context(accounts(4), T0).build());
+        assert!(refused(|| contract.post_offer(
+            sid,
+            U128(0),
+            U128(SCALE),
+            None,
+            T0 + 30_000_000_000
+        )));
+        assert!(refused(|| contract.post_offer(
+            sid,
+            U128(SCALE),
+            U128(0),
+            None,
+            T0 + 30_000_000_000
+        )));
+        assert!(refused(|| contract.post_offer(
+            sid,
+            U128(u128::MAX),
+            U128(SCALE),
+            None,
+            T0 + 30_000_000_000
+        )));
+        assert!(refused(|| contract.post_bid(
+            sid,
+            U128(0),
+            U128(SCALE),
+            T0 + 30_000_000_000
+        )));
+
+        testing_env!(context(accounts(3), T0).build());
+        assert!(refused(|| contract.fill_market_order(sid, U128(0), U128(10 * SCALE), None)));
+
+        let stats = contract.stats();
+        assert_eq!(stats.open_ticket_count, 0);
+        assert_eq!(stats.open_offer_count, 0);
+        assert_eq!(stats.open_bid_count, 0);
+        assert_eq!(stats.total_offer_collateral.0, 0);
+        assert_eq!(stats.total_bid_escrow.0, 0);
+        assert_eq!(contract.get_pool_state().reserved.0, 0);
+        // Zero and overflow are refused before anything is debited, so even the
+        // unit-test world (which does not roll back on a panic) is unchanged.
+        assert_eq!(contract.expected_custody().0, before);
+        assert_eq!(contract.get_balance(accounts(3)).0, 100 * SCALE);
+        assert_eq!(contract.get_balance(accounts(4)).0, 100 * SCALE);
+    }
+
+    #[test]
+    fn only_the_admin_and_the_venue_can_move_the_venue_controls() {
+        let mut contract = setup();
+        let state = contract.get_pool_state();
+        let (margin, impact, venue) = (state.margin_bps, state.impact_bps, state.venue_account);
+
+        testing_env!(context(outsider(), T0).build());
+        assert!(refused(|| contract.set_fee_terms(0, 0)));
+        assert!(refused(|| contract.set_venue(outsider())));
+        assert!(refused(|| contract.set_paused(true)));
+        assert!(refused(|| contract.pool_sweep()));
+        let after = contract.get_pool_state();
+        assert_eq!(
+            (after.margin_bps, after.impact_bps, after.venue_account),
+            (margin, impact, venue),
+            "a refused control leaves the venue exactly as it was"
+        );
+
+        testing_env!(context(accounts(0), T0).build());
+        contract.set_fee_terms(50, 100);
+        contract.set_venue(accounts(5));
+        testing_env!(context(accounts(0), T0).build());
+        assert!(
+            refused(|| contract.pool_sweep()),
+            "the admin is no longer the venue and cannot sweep its margin"
+        );
+        testing_env!(context(accounts(5), T0).build());
+        contract.pool_sweep();
+    }
+
+    #[test]
+    fn a_reserved_offer_is_only_for_the_taker_it_names() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        for who in [3, 4, 5] {
+            fund(&mut contract, accounts(who), 100 * SCALE);
+        }
+        testing_env!(context(accounts(4), T0).build());
+        let offer = contract.post_offer(
+            sid,
+            U128(SCALE),
+            U128(2 * SCALE),
+            Some(accounts(5)),
+            T0 + 30_000_000_000,
+        );
+
+        testing_env!(context(accounts(3), T0).build());
+        assert!(refused(|| contract.fill_offer(offer)));
+        assert_eq!(
+            contract.get_balance(accounts(3)).0,
+            100 * SCALE,
+            "a refused fill costs the caller nothing"
+        );
+        assert!(contract.get_offer(offer).is_some(), "and leaves the offer standing");
+
+        testing_env!(context(accounts(5), T0).build());
+        let ticket = contract.fill_offer(offer);
+        assert_eq!(contract.get_balance(accounts(5)).0, 98 * SCALE);
+        assert!(contract.get_offer(offer).is_none());
+        assert_eq!(contract.get_ticket(ticket).unwrap().buyer, accounts(5));
+    }
+
+    /// The whole balance sheet, checked after every mutation of the stateful
+    /// run. `issued` is what the token contract has credited to this contract:
+    /// nothing inside may create or destroy money, only move it between the
+    /// available balance, escrow, tickets and the vault's buckets.
+    fn assert_books(
+        contract: &Contract,
+        issued: u128,
+        tickets: &[u64],
+        offers: &[u64],
+        bids: &[u64],
+        label: &str,
+    ) {
+        let stats = contract.stats();
+        let vault = contract.get_pool_state();
+        assert_eq!(
+            contract.expected_custody().0,
+            issued,
+            "{label}: custody does not equal the money the contract received"
+        );
+        assert!(
+            vault.reserved.0 <= vault.equity.0,
+            "{label}: reserved {} exceeds equity {}",
+            vault.reserved.0,
+            vault.equity.0
+        );
+        assert_eq!(
+            vault.free_equity.0,
+            vault.equity.0 - vault.reserved.0,
+            "{label}: free equity is not equity less reserved"
+        );
+        let users = [accounts(0), accounts(3), accounts(4), accounts(5)];
+        let available: u128 = users
+            .iter()
+            .map(|who| contract.get_balance(who.clone()).0)
+            .sum();
+        assert_eq!(available, stats.total_available.0, "{label}: balances disagree with their total");
+
+        let (mut person_collateral, mut person_premium, mut pool_open, mut locked) =
+            (0u128, 0u128, 0u64, 0u128);
+        for id in tickets {
+            let Some(ticket) = contract.tickets.get(id) else {
+                continue;
+            };
+            let series = contract.series.get(&ticket.series_id).expect("series");
+            let width = series.high_strike - series.low_strike;
+            assert_eq!(
+                ticket.collateral,
+                accounting::max_payout(ticket.quantity, width, series.price_scale).unwrap(),
+                "{label}: ticket {id} reserved something other than its worst case"
+            );
+            if ticket.maker == vault_account() {
+                pool_open += 1;
+                locked += ticket.venue_cut;
+                assert!(ticket.premium >= ticket.venue_cut, "{label}: split exceeds premium");
+                if ticket.held {
+                    assert_eq!(ticket.venue_cut, 0, "{label}: a held ticket paid a venue fee");
+                }
+            } else {
+                assert_eq!(ticket.venue_cut, 0, "{label}: a person ticket charged a venue cut");
+                assert!(!ticket.held, "{label}: a person ticket claimed the hold path");
+                person_collateral += ticket.collateral;
+                person_premium += ticket.premium;
+            }
+        }
+        assert_eq!(
+            person_collateral, stats.total_ticket_collateral.0,
+            "{label}: person ticket collateral total"
+        );
+        assert_eq!(
+            person_premium, stats.total_ticket_premium.0,
+            "{label}: person ticket premium total"
+        );
+        assert_eq!(pool_open, vault.open_tickets, "{label}: the vault counts a different number of tickets");
+        assert_eq!(locked, vault.venue_locked.0, "{label}: refundable margin disagrees");
+        assert_eq!(
+            tickets.iter().filter(|id| contract.tickets.get(*id).is_some()).count() as u64,
+            stats.open_ticket_count,
+            "{label}: open ticket count"
+        );
+
+        let open_offers: Vec<_> = offers
+            .iter()
+            .filter_map(|id| contract.offers.get(id))
+            .collect();
+        assert_eq!(
+            open_offers.len() as u64,
+            stats.open_offer_count,
+            "{label}: open offer count"
+        );
+        assert_eq!(
+            open_offers.iter().map(|offer| offer.collateral).sum::<u128>(),
+            stats.total_offer_collateral.0,
+            "{label}: offer collateral total"
+        );
+
+        let open_bids: Vec<_> = bids.iter().filter_map(|id| contract.bids.get(id)).collect();
+        assert_eq!(
+            open_bids.len() as u64,
+            stats.open_bid_count,
+            "{label}: open bid count"
+        );
+        assert_eq!(
+            open_bids.iter().map(|bid| bid.premium).sum::<u128>(),
+            stats.total_bid_escrow.0,
+            "{label}: bid escrow total"
+        );
+        assert_eq!(
+            stats.pending_withdrawal_count, 0,
+            "{label}: the run never asks the token contract for money"
+        );
+    }
+
+    fn open_series(contract: &Contract, series_id: u64) -> bool {
+        contract
+            .get_series(series_id)
+            .map(|series| series.settlement == Settlement::Open)
+            .unwrap_or(false)
+    }
+
+    fn fix_at(contract: &mut Contract, series_id: u64, price: u128) {
+        let mut series = contract.get_series(series_id).expect("series");
+        series.settlement = Settlement::Fixed {
+            price,
+            publish_time_ns: T0,
+        };
+        contract.series.insert(series_id, series);
+    }
+
+    fn settle_where(contract: &mut Contract, series_id: u64, tickets: &[u64], at: u64) {
+        for id in tickets {
+            if let Some(ticket) = contract.get_ticket(*id) {
+                if ticket.series_id == series_id {
+                    testing_env!(context(outsider(), at).build());
+                    contract.settle_ticket(*id);
+                }
+            }
+        }
+    }
+
+    /// A session, not a scenario: deposits, both pool modes, the book, bids,
+    /// early exits, settlements and a void, in a random order. After every
+    /// single operation the test re-derives the whole balance sheet and refuses
+    /// to continue if a coin moved without a matching entry.
+    ///
+    /// This is the layer that catches the bugs examples miss: a path where a
+    /// refund is paid but the reservation is not released, or a fee is earned
+    /// twice, only shows up once one operation follows another — the exact
+    /// sequence nobody writes by hand.
+    #[test]
+    fn the_books_balance_through_a_random_multi_user_session() {
+        let mut contract = setup();
+        let mut issued = 0u128;
+        for who in [3, 4, 5] {
+            fund(&mut contract, accounts(who), 500 * SCALE);
+            issued += 500 * SCALE;
+        }
+        deposit_to_pool(&mut contract, accounts(5), 400 * SCALE);
+        issued += 400 * SCALE;
+
+        let mut sids = Vec::new();
+        for (index, offset) in [60u64, 120, 180, 240].into_iter().enumerate() {
+            testing_env!(context(accounts(0), T0).build());
+            let sid = contract.create_series(
+                "ETH".to_string(),
+                SpreadKind::Put,
+                T0 + offset * 1_000_000_000,
+                T0 + (offset + 30) * 1_000_000_000,
+                T0 + (offset + 600) * 1_000_000_000,
+                U128(100 * SCALE),
+                U128(110 * SCALE),
+                U128(SCALE),
+                5_000,
+                "ETH-USD".to_string(),
+            );
+            quote(&mut contract, sid, (3 + index as u128) * SCALE);
+            sids.push(sid);
+        }
+
+        let mut tickets: Vec<u64> = Vec::new();
+        let mut offers: Vec<u64> = Vec::new();
+        let mut bids: Vec<u64> = Vec::new();
+        let mut settled = [false; 4];
+        // Paths the session must actually reach, so a green run cannot be a run
+        // of refusals that never touched the interesting code.
+        let mut reached = [0u32; 8];
+        let mut state = 0x5EED_2026u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for step in 0..220 {
+            let who = accounts(3 + (next() % 3) as usize);
+            let sid = sids[(next() % 4) as usize];
+            let label = format!("step {step}");
+            testing_env!(context(who.clone(), T0).build());
+            match next() % 100 {
+                // Buy from the vault, and the no-exit version of the same trade.
+                0..=9 => {
+                    if open_series(&contract, sid) {
+                        quote(&mut contract, sid, (3 + (next() % 4) as u128) * SCALE);
+                        testing_env!(context(who.clone(), T0).build());
+                        if let Ok(id) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                contract.pool_buy(sid, U128(SCALE), U128(10 * SCALE))
+                            }))
+                        {
+                            reached[0] += 1;
+                            tickets.push(id);
+                        }
+                    }
+                }
+                10..=17 => {
+                    if open_series(&contract, sid) {
+                        quote(&mut contract, sid, (3 + (next() % 4) as u128) * SCALE);
+                        testing_env!(context(who.clone(), T0).build());
+                        if let Ok(id) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                contract.pool_buy_held(sid, U128(SCALE), U128(10 * SCALE))
+                            }))
+                        {
+                            reached[1] += 1;
+                            tickets.push(id);
+                        }
+                    }
+                }
+                // Sell a pool ticket back before expiry.
+                18..=27 => {
+                    if !tickets.is_empty() {
+                        let id = tickets[(next() as usize) % tickets.len()];
+                        if let Some(ticket) = contract.get_ticket(id) {
+                            if ticket.maker == vault_account() && !ticket.held {
+                                testing_env!(context(ticket.buyer, T0).build());
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    contract.pool_close(id, None)
+                                }))
+                                .is_ok()
+                                {
+                                    reached[2] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                // The person-to-person book.
+                28..=39 => {
+                    let id = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        contract.post_offer(
+                            sid,
+                            U128(SCALE),
+                            U128((2 + (next() % 5) as u128) * SCALE),
+                            None,
+                            T0 + 30_000_000_000,
+                        )
+                    }));
+                    if let Ok(id) = id {
+                        offers.push(id);
+                    }
+                }
+                40..=49 => {
+                    if !offers.is_empty() {
+                        let id = offers[(next() as usize) % offers.len()];
+                        if let Some(offer) = contract.get_offer(id) {
+                            if offer.maker != who {
+                                testing_env!(context(who.clone(), T0).build());
+                                if let Ok(ticket) =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        contract.fill_offer(id)
+                                    }))
+                                {
+                                    reached[3] += 1;
+                                    tickets.push(ticket);
+                                }
+                            }
+                        }
+                    }
+                }
+                50..=60 => {
+                    let id = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        contract.post_bid(
+                            sid,
+                            U128(SCALE),
+                            U128((2 + (next() % 5) as u128) * SCALE),
+                            T0 + 30_000_000_000,
+                        )
+                    }));
+                    if let Ok(id) = id {
+                        bids.push(id);
+                    }
+                }
+                61..=70 => {
+                    if !bids.is_empty() {
+                        let id = bids[(next() as usize) % bids.len()];
+                        if let Some(bid) = contract.bids.get(&id) {
+                            if bid.owner != who {
+                                testing_env!(context(who.clone(), T0).build());
+                                if let Ok(ticket) =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        contract.fill_bid(id)
+                                    }))
+                                {
+                                    reached[4] += 1;
+                                    tickets.push(ticket);
+                                }
+                            }
+                        }
+                    }
+                }
+                71..=73 => {
+                    if !offers.is_empty() {
+                        let id = offers[(next() as usize) % offers.len()];
+                        if let Some(offer) = contract.get_offer(id) {
+                            testing_env!(context(offer.maker, T0).build());
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                contract.cancel_offer(id)
+                            }));
+                        }
+                    }
+                }
+                74..=76 => {
+                    if !bids.is_empty() {
+                        let id = bids[(next() as usize) % bids.len()];
+                        if let Some(bid) = contract.bids.get(&id).cloned() {
+                            testing_env!(context(bid.owner, T0).build());
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                contract.cancel_bid(id)
+                            }));
+                        }
+                    }
+                }
+                // Sell a whole ticket into a resting bid.
+                77..=87 => {
+                    if !tickets.is_empty() {
+                        let id = tickets[(next() as usize) % tickets.len()];
+                        if let Some(ticket) = contract.get_ticket(id) {
+                            testing_env!(context(ticket.buyer, T0).build());
+                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                contract.close_ticket(id, None)
+                            }))
+                            .is_ok()
+                            {
+                                reached[5] += 1;
+                            }
+                        }
+                    }
+                }
+                // The LP's exit and the venue's sweep.
+                88..=91 => {
+                    testing_env!(context(accounts(5), T0).build());
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        contract.pool_withdraw(U128((1 + (next() % 8) as u128) * SCALE))
+                    }));
+                }
+                92..=94 => {
+                    testing_env!(context(accounts(0), T0).build());
+                    contract.pool_sweep();
+                }
+                _ => {
+                    // Settle one of the first three series at a random price.
+                    // The fourth is left for the void at the end.
+                    let candidates: Vec<usize> = (0..3).filter(|i| !settled[*i]).collect();
+                    if !candidates.is_empty() {
+                        let index = candidates[(next() as usize) % candidates.len()];
+                        let price = (80 + (next() % 60) as u128) * SCALE;
+                        fix_at(&mut contract, sids[index], price);
+                        settle_where(&mut contract, sids[index], &tickets, T0 + 60_000_000_000);
+                        settled[index] = true;
+                        reached[6] += 1;
+                    }
+                }
+            }
+            // Every accepted pool ticket has to be payable at its own worst
+            // case, which is what the reservation was for.
+            assert_books(&contract, issued, &tickets, &offers, &bids, &label);
+        }
+
+        // Whatever is still open runs off: the three early series at a random
+        // price, the last one through the outage path.
+        for index in 0..3 {
+            if !settled[index] {
+                fix_at(&mut contract, sids[index], (80 + (next() % 60) as u128) * SCALE);
+                settle_where(&mut contract, sids[index], &tickets, T0 + 60_000_000_000);
+            }
+        }
+        testing_env!(
+            context(outsider(), T0 + 3_000_000_000_000).build()
+        );
+        contract.void_series(sids[3]);
+        reached[7] += 1;
+        settle_where(&mut contract, sids[3], &tickets, T0 + 3_000_000_000_000);
+        assert_books(&contract, issued, &tickets, &offers, &bids, "after the last settlement");
+
+        assert_eq!(contract.stats().open_ticket_count, 0, "every ticket ran off");
+        assert_eq!(contract.get_pool_state().open_tickets, 0);
+        assert_eq!(contract.get_pool_state().reserved.0, 0);
+        assert_eq!(contract.get_pool_state().venue_locked.0, 0);
+        let earned = contract.get_pool_state().venue.0;
+        assert_eq!(sweep(&mut contract), earned, "the venue takes its whole accrual");
+        assert_eq!(contract.get_pool_state().venue.0, 0);
+        assert_books(&contract, issued, &tickets, &offers, &bids, "after the sweep");
+        // Every token still belongs to someone: the LPs, the venue, or the
+        // traders who funded the run.
+        assert_eq!(contract.expected_custody().0, issued);
+        assert!(
+            reached.iter().all(|count| *count > 0),
+            "the session never exercised one of its paths: {reached:?}"
         );
     }
 }

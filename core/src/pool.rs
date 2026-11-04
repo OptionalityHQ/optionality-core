@@ -8,8 +8,12 @@
 //!   arithmetic, not a forecast, so the pool reserves exactly what it could owe.
 //!   A perpetual pool cannot say this, which is why perp vaults get liquidated
 //!   and this one does not need to.
-//! - **The premium already collected pays part of that worst case.** Only the
-//!   remainder is real exposure, so `reserved` counts net of it.
+//! - **The reservation is the whole worst case, not the loss after the
+//!   premium.** At expiry the pool pays `payout` out of equity, and the premium
+//!   is already in equity, so the full `max_payout` has to stay covered. The
+//!   premium lowers how much equity the write consumes; it does not lower what
+//!   the vault must hold. Reserving only `max_payout - premium` let LPs withdraw
+//!   the premium a payout still needed, which is insolvency with extra steps.
 //!
 //! The invariant everything else depends on is `reserved ≤ equity`. Every method
 //! here either preserves it or refuses.
@@ -36,7 +40,8 @@ pub struct Pool {
     /// LP principal plus pool money earned, net of what has been paid out.
     /// The only bucket share prices are read against.
     pub equity: u128,
-    /// Worst case still owed across open positions, after the premium kept.
+    /// Worst case still owed across open positions: the full max payout, since
+    /// that is what the vault pays at expiry out of this equity.
     pub reserved: u128,
     /// Margin collected on open tickets. Encumbered: a void returns it.
     pub venue_locked: u128,
@@ -98,9 +103,14 @@ impl Pool {
     }
 
     /// Could the pool take this without breaking its own invariant?
+    ///
+    /// The new position's whole worst case has to fit inside today's equity plus
+    /// the premium it is about to collect. Checking only the net-of-premium
+    /// exposure against `equity + premium` counts the premium twice and lets a
+    /// position through that the vault cannot pay at expiry — a ticket that
+    /// cannot settle, which is worse than refusing it.
     pub fn can_write(&self, max_payout: u128, lp_notional: u128) -> bool {
-        let exposure = max_payout.saturating_sub(lp_notional);
-        self.reserved.saturating_add(exposure) <= self.equity.saturating_add(lp_notional)
+        self.reserved.saturating_add(max_payout) <= self.equity.saturating_add(lp_notional)
     }
 
     /// Take a position. The buyer's premium arrives split into the pool's share,
@@ -119,9 +129,7 @@ impl Pool {
         }
         self.equity = self.equity.checked_add(lp_notional)?;
         self.venue_locked = self.venue_locked.checked_add(venue_cut)?;
-        self.reserved = self
-            .reserved
-            .checked_add(max_payout.saturating_sub(lp_notional))?;
+        self.reserved = self.reserved.checked_add(max_payout)?;
         Some(Written {
             max_payout,
             lp_notional,
@@ -145,7 +153,7 @@ impl Pool {
             return None;
         }
         self.equity = self.equity.checked_sub(payout)?;
-        self.reserved = self.reserved.checked_sub(position.exposure())?;
+        self.reserved = self.reserved.checked_sub(position.max_payout)?;
         self.earn(position.venue_cut)
     }
 
@@ -156,7 +164,7 @@ impl Pool {
             return None;
         }
         self.equity = self.equity.checked_sub(exit_value)?;
-        self.reserved = self.reserved.checked_sub(position.exposure())?;
+        self.reserved = self.reserved.checked_sub(position.max_payout)?;
         self.earn(position.venue_cut)
     }
 
@@ -166,7 +174,7 @@ impl Pool {
     pub fn void_out(&mut self, position: &Written) -> Option<()> {
         self.equity = self.equity.checked_sub(position.lp_notional)?;
         self.venue_locked = self.venue_locked.checked_sub(position.venue_cut)?;
-        self.reserved = self.reserved.checked_sub(position.exposure())?;
+        self.reserved = self.reserved.checked_sub(position.max_payout)?;
         Some(())
     }
 
@@ -243,19 +251,43 @@ mod tests {
     }
 
     #[test]
-    fn a_worst_case_is_reserved_net_of_the_premium_kept() {
+    fn a_premium_is_not_counted_twice_when_reserving() {
+        let mut pool = funded();
+        // 3 contracts of a 100-wide spread, worst case 300, sold for 100 against
+        // 100 of equity. The net exposure is 200 and the equity is 100, so the
+        // ticket must be refused: allowing it would mean writing a payoff the
+        // vault cannot make at expiry.
+        let mut thin = Pool::empty();
+        thin.deposit(100 * SCALE).unwrap();
+        assert!(thin.write(3 * ONE, WIDTH, SCALE, 100 * SCALE, 0).is_none());
+        assert_eq!(thin.reserved, 0);
+
+        // The same ticket fits once the equity covers the net exposure, and the
+        // worst case then takes exactly that equity.
+        thin.deposit(100 * SCALE).unwrap();
+        let written = thin.write(3 * ONE, WIDTH, SCALE, 100 * SCALE, 0).unwrap();
+        assert!(thin.settle(&written, written.max_payout).is_some());
+        assert_eq!(thin.equity, 0);
+    }
+
+    #[test]
+    fn the_whole_worst_case_is_reserved_even_after_the_premium() {
         let mut pool = funded();
         // Buyer pays 3,000 for a 10,000 max payout: 2,900 pool, 100 venue.
         let written = pool
             .write(100 * ONE, WIDTH, SCALE, 2_900 * SCALE, 100 * SCALE)
             .unwrap();
         assert_eq!(written.max_payout, 10_000 * SCALE);
-        assert_eq!(written.exposure(), 7_100 * SCALE);
-        assert_eq!(pool.reserved, 7_100 * SCALE);
+        assert_eq!(written.exposure(), 7_100 * SCALE, "the net risk, for reporting");
+        assert_eq!(
+            pool.reserved, 10_000 * SCALE,
+            "but the vault reserves the gross payout it must actually make"
+        );
         assert_eq!(pool.equity, 22_900 * SCALE);
         assert_eq!(pool.venue_locked, 100 * SCALE);
         assert_eq!(pool.venue, 0, "not earned until the ticket runs off");
         assert!(pool.reserved <= pool.equity);
+        assert_eq!(pool.free_equity(), 12_900 * SCALE);
     }
 
     #[test]
@@ -314,7 +346,7 @@ mod tests {
         let written = pool.write(100 * ONE, WIDTH, SCALE, 2_900 * SCALE, 100 * SCALE).unwrap();
         assert_eq!(pool.settle(&written, 10_000 * SCALE + 1), None);
         assert_eq!(pool.close(&written, 10_000 * SCALE + 1), None);
-        assert_eq!(pool.reserved, written.exposure());
+        assert_eq!(pool.reserved, written.max_payout);
     }
 
     #[test]
@@ -364,10 +396,10 @@ mod tests {
         let written = pool
             .write(100 * ONE, WIDTH, SCALE, 2_900 * SCALE, 100 * SCALE)
             .unwrap();
-        // Free equity is 22,900 − 7,100, so a sweep limited only by slack would
+        // Free equity is 22,900 − 10,000, so a sweep limited only by slack would
         // happily hand the 100 back. It must not: the ticket is still voidable
         // and the refund needs that slice.
-        assert_eq!(pool.free_equity(), 15_800 * SCALE);
+        assert_eq!(pool.free_equity(), 12_900 * SCALE);
         assert_eq!(pool.sweep_venue(), 0);
         assert_eq!(pool.venue_locked, 100 * SCALE);
 
