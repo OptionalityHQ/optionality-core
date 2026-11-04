@@ -2554,6 +2554,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "oracle-sources",
+ "serde_json",
 ]
 
 [[package]]

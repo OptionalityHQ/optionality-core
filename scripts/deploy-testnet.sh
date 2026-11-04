@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NETWORK=${NETWORK:-testnet}
-RPC_URL=${RPC_URL:-https://rpc.testnet.near.org}
+RPC_URL=${RPC_URL:-https://rpc.testnet.fastnear.com}
 VENUE=${VENUE:-}
 CONFIRM=${1:-}
 
@@ -33,6 +33,8 @@ ORACLE_ID="oracle.$VENUE"
 OPTIONS_ID="options.$VENUE"
 
 SCALE=1000000
+INITIAL_BALANCE=${INITIAL_BALANCE:-2}
+OPTIONS_INITIAL_BALANCE=${OPTIONS_INITIAL_BALANCE:-4}
 GAS=100000000000000   # 100 Tgas: enough for an init call with a map write
 WASM_DIR=target/near
 
@@ -47,12 +49,13 @@ if [ "$CONFIRM" != "--yes" ]; then
   say "what --yes does, in this order:"
   say "  1. build the three wasm artifacts (scripts/build.sh)"
   say "  2. create $TOKEN_ID, $ORACLE_ID, $OPTIONS_ID as subaccounts of $VENUE"
-  say "     (each with 10 NEAR: they pay storage rent for the state they hold)"
+  say "     (token/oracle: $INITIAL_BALANCE NEAR each; options: $OPTIONS_INITIAL_BALANCE NEAR)"
   say "  3. deploy mock-ft         -> $TOKEN_ID       new(owner=$VENUE)"
   say "  4. deploy price-oracle    -> $ORACLE_ID      new(owner=$VENUE)"
   say "  5. deploy bounded-options -> $OPTIONS_ID     new(admin, token, oracle)"
   say "  6. set_venue($VENUE) and set_fee_terms(50,100)"
-  say "  7. add_source(...) on the ORACLE for each seat in data/testnet-seats, then set_quorum(2)"
+  say "  7. generate four seat keys in data/testnet-seats, register them on the"
+  say "     ORACLE, set_quorum(2) — refuse if any of it fails"
   say "  8. write data/testnet-session.json (no secrets in it)"
   say ""
   say "it does NOT wire a visitor wallet. The gateway still signs with whatever"
@@ -76,8 +79,10 @@ for account in "$TOKEN_ID" "$ORACLE_ID" "$OPTIONS_ID"; do
   if near state "$account" --network-id "$NETWORK" >/dev/null 2>&1; then
     say "    $account exists, leaving it alone"
   else
+    balance=$INITIAL_BALANCE
+    [ "$account" != "$OPTIONS_ID" ] || balance=$OPTIONS_INITIAL_BALANCE
     near create-account "$account" --use-account "$VENUE" \
-      --initial-balance 10 --network-id "$NETWORK"
+      --initial-balance "$balance" --network-id "$NETWORK"
   fi
 done
 
@@ -114,41 +119,44 @@ near call "$OPTIONS_ID" set_fee_terms '{"margin_bps":50,"impact_bps":100}' \
   --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
 
 say "==> 7/8 the settlement committee"
-# Seats live on the ORACLE contract, not the options contract, and a seat is a
-# name plus a public key that the oracle will accept signed prices from.
+# Seats live on the ORACLE contract: a seat is a name plus a public key the oracle
+# will accept signed prices from. The contract refuses to fix a price without two
+# independent sources, and refuses to settle without a fix — so a venue deployed
+# without this step lists markets that can never settle.
 #
-# This is the step the sandbox does in-process and cannot be done the same way
-# here: `oracle-signer` generates its key from a random seed at startup
-# (tools/oracle-signer/src/main.rs:39) and never writes it down. In the sandbox
-# that is fine, because the seats and the chain die together. On testnet a seat
-# whose key changes on restart becomes a registered source that can never sign
-# again, and the venue can never settle a ticket.
-#
-# So the script refuses to guess. It registers seats only from a directory of
-# key material you supply, and says so when there is none.
+# The keys are generated here and kept, not regenerated on boot. A sandbox seat is
+# correct to forget its key: the chain it signs for is deleted with the process. A
+# testnet seat is the opposite. If its key changes on restart it becomes a source
+# registered on chain that no longer exists on the machine, and every settlement
+# after that restart fails.
 SEATS_DIR=${SEATS_DIR:-data/testnet-seats}
-if [ -d "$SEATS_DIR" ] && ls "$SEATS_DIR"/*.json >/dev/null 2>&1; then
-  for seat in "$SEATS_DIR"/*.json; do
-    say "    registering $(basename "$seat" .json)"
-    near call "$ORACLE_ID" add_source "$(cat "$seat")" \
-      --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
-  done
-  near call "$ORACLE_ID" set_quorum '{"quorum":2}' \
-    --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
-else
-  say "    no seat keys in $SEATS_DIR — SKIPPING."
-  say ""
-  say "    Without seats the venue lists markets that can never settle: the"
-  say "    contract refuses to fix a price without two independent sources, and"
-  say "    refuses to settle without a fix. Deploying without this step gives you"
-  say "    contracts you can call and a product nobody can trade."
-  say ""
-  say "    Each file must look like:"
-  say "      {\"name\": \"kraken\", \"public_key\": [<32 bytes>]}"
-  say ""
-  say "    The durable-key work — persisting seat keys across restarts — is not"
-  say "    done. See docs/10-testnet.md, 'What is still missing'."
+SIGNER=${SIGNER:-target/debug/oracle-signer}
+if [ ! -x "$SIGNER" ]; then
+  say "    building oracle-signer"
+  cargo build -p oracle-signer >/dev/null
 fi
+for seat in venue-index kraken okx pyth; do
+  "$SIGNER" --name "$seat" \
+    --key-file "$SEATS_DIR/$seat.key" \
+    --registration-out "$SEATS_DIR/$seat.json" >/dev/null
+  say "    $seat  $(cat "$SEATS_DIR/$seat.json")"
+done
+say ""
+say "    these four keys own the settlement vote. Back them up: without them the"
+say "    venue can never settle a ticket again. They are written 0600 — but on this"
+say "    machine the relay can read them, so a real committee keeps them apart."
+say ""
+# Quorum 2 of 4: two sources can settle, and one source alone never can. That is
+# the property the contract's require! enforces, and the reason a single dishonest
+# seat is not enough to move a payout.
+for seat in venue-index kraken okx pyth; do
+  near call "$ORACLE_ID" add_source "$(cat "$SEATS_DIR/$seat.json")" \
+    --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK" >/dev/null
+  say "    registered $seat"
+done
+near call "$ORACLE_ID" set_quorum '{"quorum":2}' \
+  --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
+say "    quorum 2 of 4"
 
 say "==> 8/8 writing the session file"
 mkdir -p data

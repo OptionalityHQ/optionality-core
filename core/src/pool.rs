@@ -252,7 +252,6 @@ mod tests {
 
     #[test]
     fn a_premium_is_not_counted_twice_when_reserving() {
-        let mut pool = funded();
         // 3 contracts of a 100-wide spread, worst case 300, sold for 100 against
         // 100 of equity. The net exposure is 200 and the equity is 100, so the
         // ticket must be refused: allowing it would mean writing a payoff the

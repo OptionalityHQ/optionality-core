@@ -1,2 +1,8 @@
 /target
 sim/.bundle-check.mjs
+
+/data/testnet-seats/
+
+/data/private/
+/demo/wallet.js
+/demo/wallet.css

@@ -1,8 +1,13 @@
 //! Minimal NEP-141 token for testnet demos.
 //!
 //! It implements registration, transfers, `ft_transfer_call` and the refund
-//! resolver. It is test collateral, not a production stablecoin: storage is
-//! underfunded and minting is owner-controlled.
+//! resolver. It is test collateral, not a production stablecoin: minting is
+//! owner-controlled and there is no allowance mechanism.
+//!
+//! Storage is funded, though. A NEAR contract pays rent per byte of state out of
+//! its own balance, so a token that registers accounts for a yoctoNEAR is a token
+//! that drains its account and then refuses every transfer — on a public network,
+//! usually on the day of the demo.
 
 use near_sdk::borsh::BorshSerialize;
 use near_sdk::json_types::U128;
@@ -11,6 +16,10 @@ use near_sdk::{
     env, ext_contract, near, require, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault,
     Promise,
 };
+
+/// One row of `accounts`: a 64-ish byte `AccountId` key and a 32-byte balance,
+/// plus the `LookupMap` overhead. Measured from the store, then rounded up.
+const ACCOUNT_STORAGE_BYTES: u64 = 128;
 
 const GAS_FOR_FT_ON_TRANSFER: Gas = Gas::from_tgas(30);
 const GAS_FOR_RESOLVE: Gas = Gas::from_tgas(25);
@@ -49,6 +58,9 @@ pub struct Contract {
     owner: AccountId,
     accounts: LookupMap<AccountId, Account>,
     total_supply: u128,
+    /// Rent this contract has been paid for the rows it stores. Kept so an
+    /// operator can see the tab, the same way the options contract does.
+    storage_paid: NearToken,
 }
 
 #[near]
@@ -59,18 +71,48 @@ impl Contract {
             owner,
             accounts: LookupMap::new(StorageKey::Accounts),
             total_supply: 0,
+            storage_paid: NearToken::from_yoctonear(0),
         }
     }
 
+    /// Register an account, paying for the row it occupies.
+    ///
+    /// The old version accepted a single yoctoNEAR, which is not a payment, it is
+    /// a formality: the contract paid the rent for every account it registered
+    /// and had no way to recover it. NEP-141 defines this call, so the amount is
+    /// the protocol's, not ours: the caller covers `ACCOUNT_STORAGE_BYTES`, and
+    /// overpayment is refunded rather than kept.
     #[payable]
     pub fn storage_deposit(&mut self, account_id: Option<AccountId>) -> AccountId {
-        require!(
-            env::attached_deposit() >= NearToken::from_yoctonear(1),
-            "attach NEAR for storage"
-        );
         let target = account_id.unwrap_or_else(env::predecessor_account_id);
-        if !self.accounts.contains_key(&target) {
+        let known = self.accounts.contains_key(&target);
+        // Registering twice costs nothing the second time: the row already exists.
+        if !known {
+            let price = env::storage_byte_cost();
+            let owed = price.saturating_mul(ACCOUNT_STORAGE_BYTES as u128);
+            let attached = env::attached_deposit();
+            require!(
+                attached >= owed,
+                format!(
+                    "registering an account stores {ACCOUNT_STORAGE_BYTES} bytes; attach at least {} yoctoNEAR",
+                    owed.as_yoctonear()
+                )
+            );
             self.accounts.insert(target.clone(), Account { balance: 0 });
+            self.storage_paid = self.storage_paid.saturating_add(owed);
+            if attached > owed {
+                Promise::new(env::predecessor_account_id())
+                    .transfer(attached.saturating_sub(owed))
+                    .detach();
+            }
+            return target;
+        }
+        // Registration is idempotent. Return any attached deposit to the payer.
+        let attached = env::attached_deposit();
+        if attached.as_yoctonear() > 0 {
+            Promise::new(env::predecessor_account_id())
+                .transfer(attached)
+                .detach();
         }
         target
     }
@@ -115,16 +157,16 @@ impl Contract {
     }
 
     pub fn ft_balance_of(&self, account_id: AccountId) -> U128 {
-        U128(self.accounts.get(&account_id).map(|a| a.balance).unwrap_or(0))
+        U128(
+            self.accounts
+                .get(&account_id)
+                .map(|a| a.balance)
+                .unwrap_or(0),
+        )
     }
 
     #[payable]
-    pub fn ft_transfer(
-        &mut self,
-        receiver_id: AccountId,
-        amount: U128,
-        _memo: Option<String>,
-    ) {
+    pub fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, _memo: Option<String>) {
         require_one_yocto();
         require!(amount.0 > 0, "amount must be positive");
         self.internal_transfer(&env::predecessor_account_id(), &receiver_id, amount.0);
@@ -193,7 +235,11 @@ impl Contract {
     }
 
     fn credit(&mut self, account_id: &AccountId, amount: u128) {
-        let balance = self.accounts.get(account_id).map(|a| a.balance).unwrap_or(0);
+        let balance = self
+            .accounts
+            .get(account_id)
+            .map(|a| a.balance)
+            .unwrap_or(0);
         self.accounts.insert(
             account_id.clone(),
             Account {
@@ -203,7 +249,11 @@ impl Contract {
     }
 
     fn debit(&mut self, account_id: &AccountId, amount: u128) {
-        let balance = self.accounts.get(account_id).map(|a| a.balance).unwrap_or(0);
+        let balance = self
+            .accounts
+            .get(account_id)
+            .map(|a| a.balance)
+            .unwrap_or(0);
         require!(balance >= amount, "insufficient token balance");
         self.accounts.insert(
             account_id.clone(),
@@ -219,4 +269,152 @@ fn require_one_yocto() {
         env::attached_deposit() == NearToken::from_yoctonear(1),
         "requires exactly 1 yoctoNEAR"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+
+    fn setup() -> Contract {
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id(accounts(0))
+            .predecessor_account_id(accounts(0))
+            .attached_deposit(NearToken::from_yoctonear(0));
+        testing_env!(ctx.build());
+        Contract::new(accounts(0))
+    }
+
+    fn price() -> NearToken {
+        env::storage_byte_cost().saturating_mul(ACCOUNT_STORAGE_BYTES as u128)
+    }
+
+    /// Registration is the one write this token makes on a stranger's behalf, and
+    /// it is permanent. A yoctoNEAR is not payment for it.
+    #[test]
+    fn registering_an_account_costs_its_own_rent() {
+        let mut contract = setup();
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(NearToken::from_yoctonear(1));
+        testing_env!(ctx.build());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.storage_deposit(None)
+        }));
+        assert!(
+            refused.is_err(),
+            "one yoctoNEAR must not register an account"
+        );
+
+        // Exactly the rent is enough.
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(price());
+        testing_env!(ctx.build());
+        assert_eq!(contract.storage_deposit(None), accounts(2));
+        assert_eq!(contract.storage_balance_of(accounts(2)), Some(U128(0)));
+    }
+
+    /// Registering twice adds no row, so it must not be a second charge — and it
+    /// must not quietly pocket a deposit either.
+    #[test]
+    fn a_second_registration_refunds_the_deposit() {
+        let mut contract = setup();
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(price());
+        testing_env!(ctx.build());
+        contract.storage_deposit(None);
+
+        // Free when nothing is attached.
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(NearToken::from_yoctonear(0));
+        testing_env!(ctx.build());
+        assert_eq!(contract.storage_deposit(None), accounts(2));
+
+        // A repeated registration succeeds and refunds the entire deposit.
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(price());
+        testing_env!(ctx.build());
+        assert_eq!(contract.storage_deposit(None), accounts(2));
+        let receipts = near_sdk::test_utils::get_created_receipts();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].receiver_id, accounts(2));
+        assert!(format!("{:?}", receipts[0].actions).contains(&price().as_yoctonear().to_string()));
+    }
+
+    /// The mint is owner-only, which is what stops a visitor from writing
+    /// themselves test dollars.
+    #[test]
+    fn only_the_owner_can_mint() {
+        let mut contract = setup();
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(price());
+        testing_env!(ctx.build());
+        contract.storage_deposit(None);
+
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.mint(accounts(2), U128(1_000))
+        }));
+        assert!(refused.is_err(), "a stranger must not mint");
+
+        // The owner can, and the supply follows.
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(accounts(0))
+            .predecessor_account_id(accounts(0))
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.mint(accounts(2), U128(1_000));
+        assert_eq!(contract.ft_balance_of(accounts(2)), U128(1_000));
+        assert_eq!(contract.ft_total_supply(), U128(1_000));
+    }
+
+    /// A transfer needs the receiver registered, because the transfer writes a row
+    /// for them and someone has to have paid for it.
+    #[test]
+    fn a_transfer_to_an_unregistered_account_is_refused() {
+        let mut contract = setup();
+        for who in [accounts(2)] {
+            let mut ctx = VMContextBuilder::new();
+            ctx.current_account_id(accounts(0))
+                .predecessor_account_id(who)
+                .attached_deposit(price());
+            testing_env!(ctx.build());
+            contract.storage_deposit(None);
+        }
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(accounts(0))
+            .predecessor_account_id(accounts(0))
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.mint(accounts(2), U128(1_000));
+
+        // accounts(3) never registered.
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(accounts(0))
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(NearToken::from_yoctonear(1))
+            .build());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.ft_transfer(accounts(3), U128(10), None)
+        }));
+        assert!(refused.is_err());
+        // And the sender kept every unit.
+        assert_eq!(contract.ft_balance_of(accounts(2)), U128(1_000));
+    }
 }

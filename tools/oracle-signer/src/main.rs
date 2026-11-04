@@ -36,7 +36,28 @@ fn main() -> std::io::Result<()> {
     let source = arg("--source", &name);
     let engine = arg("--engine", "http://127.0.0.1:8791");
     let socket = arg("--socket", "data/oracle/seat.sock");
-    let key = SigningKey::from_bytes(&random_seed());
+    let key = match arg_opt("--key-file") {
+        Some(path) => load_or_create_key(&path)?,
+        None => SigningKey::from_bytes(&random_seed()),
+    };
+    // Prepare a seat's identity and stop. Deploying to a public network needs the
+    // public key before any signer runs, because the seat has to be registered on
+    // the oracle contract before the venue can settle anything.
+    if let Some(path) = arg_opt("--registration-out") {
+        let registration = serde_json::json!({
+            "name": name,
+            "public_key": key.verifying_key().to_bytes().to_vec(),
+        });
+        if let Some(parent) = Path::new(&path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, format!("{registration}\n"))?;
+        println!(
+            "registration {path} {}",
+            hex::encode(key.verifying_key().to_bytes())
+        );
+        return Ok(());
+    }
     if let Some(parent) = Path::new(&socket).parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -44,7 +65,10 @@ fn main() -> std::io::Result<()> {
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     let cache: RefCell<HashMap<String, (Instant, Tick)>> = RefCell::new(HashMap::new());
-    println!("ready {name} {}", hex::encode(key.verifying_key().to_bytes()));
+    println!(
+        "ready {name} {}",
+        hex::encode(key.verifying_key().to_bytes())
+    );
     std::io::stdout().flush()?;
     for stream in listener.incoming().flatten() {
         if let Err(error) = serve(stream, &name, &source, &engine, &key, &cache) {
@@ -140,8 +164,18 @@ fn observe_cached(
         }
     }
     let tick = fetch(feed)?;
-    cache.borrow_mut().insert(feed.to_string(), (Instant::now(), tick));
+    cache
+        .borrow_mut()
+        .insert(feed.to_string(), (Instant::now(), tick));
     Ok(tick)
+}
+
+fn arg_opt(name: &str) -> Option<String> {
+    let argv: Vec<String> = std::env::args().collect();
+    argv.iter()
+        .position(|entry| entry == name)
+        .and_then(|index| argv.get(index + 1))
+        .cloned()
 }
 
 fn arg(name: &str, fallback: &str) -> String {
@@ -151,6 +185,68 @@ fn arg(name: &str, fallback: &str) -> String {
         .and_then(|index| argv.get(index + 1))
         .map(|value| value.to_string())
         .unwrap_or_else(|| fallback.to_string())
+}
+
+/// A seat's key, from a file, created the first time it is asked for.
+///
+/// The default stays ephemeral: a sandbox seat is correct to forget its key,
+/// because the chain it signs for is deleted along with the process. A public
+/// network is the opposite — a seat whose key changes on restart is a registered
+/// source that can never sign again, which means the venue can never settle a
+/// ticket, which means the product is a set of contracts nobody can use.
+///
+/// This trades one property for another, and the trade is real: a key on disk can
+/// be read by anything running as the same user, including the relay that owns the
+/// socket. The protection that matters — that a signature is this process's claim
+/// about its own read, not a number it was handed — survives only as long as the
+/// file is not readable by another party. So it is written `0600`, and an operator
+/// running a real committee should keep these somewhere the relay cannot reach.
+fn load_or_create_key(path: &str) -> std::io::Result<SigningKey> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            let trimmed = existing.trim();
+            let bytes = hex::decode(trimmed).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{path} is not a hex key: {error}"),
+                )
+            })?;
+            let seed: [u8; 32] = bytes.try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{path} must hold exactly 32 bytes, not {}",
+                        trimmed.len() / 2
+                    ),
+                )
+            })?;
+            return Ok(SigningKey::from_bytes(&seed));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let seed = random_seed();
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    // Write the file before trusting it, and make it private in the same step:
+    // a key that exists for a moment with default permissions is a key that has
+    // already been copied.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(hex::encode(seed).as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    Ok(SigningKey::from_bytes(&seed))
 }
 
 fn random_seed() -> [u8; 32] {
@@ -185,7 +281,10 @@ mod tests {
     #[test]
     fn pubkey_is_the_one_it_signs_with() {
         let reply = answer("pubkey", "kraken", &key(), &seen(1));
-        assert_eq!(reply, format!("ok {}", hex::encode(key().verifying_key().to_bytes())));
+        assert_eq!(
+            reply,
+            format!("ok {}", hex::encode(key().verifying_key().to_bytes()))
+        );
     }
 
     #[test]
@@ -196,20 +295,36 @@ mod tests {
         assert_eq!(parts[0], "77000000000");
         assert_eq!(parts[1], "1793000000000000000");
         assert_eq!(parts[2], "9900");
-        let signature: [u8; 64] = hex::decode(parts[3]).expect("hex").try_into().expect("64 bytes");
-        let message =
-            signing_message("BTC-USD", "kraken", 77_000_000_000, 1_793_000_000_000_000_000, 9_900);
+        let signature: [u8; 64] = hex::decode(parts[3])
+            .expect("hex")
+            .try_into()
+            .expect("64 bytes");
+        let message = signing_message(
+            "BTC-USD",
+            "kraken",
+            77_000_000_000,
+            1_793_000_000_000_000_000,
+            9_900,
+        );
         assert!(key()
             .verifying_key()
             .verify(&message, &ed25519_dalek::Signature::from_bytes(&signature))
             .is_ok());
         // The same signature against another seat's name does not verify, which is
         // what stops a relay relabelling votes it already holds.
-        let elsewhere =
-            signing_message("BTC-USD", "okx", 77_000_000_000, 1_793_000_000_000_000_000, 9_900);
+        let elsewhere = signing_message(
+            "BTC-USD",
+            "okx",
+            77_000_000_000,
+            1_793_000_000_000_000_000,
+            9_900,
+        );
         assert!(key()
             .verifying_key()
-            .verify(&elsewhere, &ed25519_dalek::Signature::from_bytes(&signature))
+            .verify(
+                &elsewhere,
+                &ed25519_dalek::Signature::from_bytes(&signature)
+            )
             .is_err());
     }
 
@@ -234,7 +349,6 @@ mod tests {
         assert!(answer("observe", "kraken", &key(), &seen(1)).starts_with("err observe wants"));
     }
 
-
     #[test]
     fn a_loop_on_the_socket_does_not_become_a_loop_on_the_source() {
         use std::cell::Cell;
@@ -242,7 +356,11 @@ mod tests {
         let cache: RefCell<HashMap<String, (Instant, Tick)>> = RefCell::new(HashMap::new());
         let fetch = |_feed: &str| -> Result<Tick, String> {
             calls.set(calls.get() + 1);
-            Ok(Tick { price_units: 7, publish_time_ns: 1, confidence_bps: 9_900 })
+            Ok(Tick {
+                price_units: 7,
+                publish_time_ns: 1,
+                confidence_bps: 9_900,
+            })
         };
         for _ in 0..25 {
             observe_cached(&cache, "BTC-USD", &fetch).expect("an observation");
@@ -250,6 +368,59 @@ mod tests {
         assert_eq!(calls.get(), 1, "twenty-five asks, one read of the source");
         observe_cached(&cache, "ETH-USD", &fetch).expect("its own cache line");
         assert_eq!(calls.get(), 2, "and each feed has its own");
+    }
+
+    /// A seat on a public network must come back as itself. If the key were
+    /// regenerated on restart, the seat registered on the oracle contract would be
+    /// one nobody holds the private half of, and the venue could never settle.
+    #[test]
+    fn a_durable_seat_keeps_its_key_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("seat-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("kraken.key");
+        let path = path.to_str().expect("utf-8 path");
+
+        let first = load_or_create_key(path).expect("first key");
+        let second = load_or_create_key(path).expect("reloaded key");
+        assert_eq!(first.verifying_key(), second.verifying_key());
+
+        // And it is the key on disk, not one that merely round-tripped in memory.
+        let on_disk = std::fs::read_to_string(path).expect("read");
+        let seed: [u8; 32] = hex::decode(on_disk.trim())
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        assert_eq!(
+            SigningKey::from_bytes(&seed).verifying_key(),
+            first.verifying_key()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dangerous failure is the quiet one: a corrupt file that we "helpfully"
+    /// replace with a fresh key looks like success and silently unseats the
+    /// committee. Refusing is the only safe answer.
+    #[test]
+    fn a_damaged_key_file_is_refused_not_regenerated() {
+        let dir = std::env::temp_dir().join(format!("seat-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let not_hex = dir.join("not-hex.key");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(&not_hex, "this is not a key\n").expect("write");
+        let error = load_or_create_key(not_hex.to_str().expect("utf-8")).expect_err("refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let short = dir.join("short.key");
+        std::fs::write(&short, "aabbcc\n").expect("write");
+        let error = load_or_create_key(short.to_str().expect("utf-8")).expect_err("refused");
+        assert!(
+            error.to_string().contains("32 bytes"),
+            "the message must say what is wrong: {error}"
+        );
+        // The bad file is still there, untouched: we refused, we did not overwrite.
+        assert_eq!(std::fs::read_to_string(&short).expect("read"), "aabbcc\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

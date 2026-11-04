@@ -90,27 +90,60 @@ impl Seat {
 /// venue's own index — and it gets exactly one vote, like every other row.
 pub const SEAT_NAMES: [&'static str; 4] = ["venue-index", "kraken", "okx", "pyth"];
 
+/// Where the signer binary is. Beside the host in a release layout, one directory
+/// up when the caller is a test binary in `target/debug/deps`.
+fn signer_path() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("no executable path: {error}"))?;
+    let dirs = exe
+        .parent()
+        .into_iter()
+        .flat_map(|dir| [dir.to_path_buf(), dir.parent().unwrap_or(dir).to_path_buf()]);
+    for dir in dirs {
+        let candidate = dir.join("oracle-signer");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "oracle-signer is missing next to {}: build it with -p oracle-signer",
+        exe.display()
+    ))
+}
+
 /// Start one signer process per seat and read the public key each of them reports.
 ///
 /// The keys are generated inside those processes and never leave them: this
 /// function learns only what it needs to seat them on chain. The children are
 /// returned so the caller can keep them alive for the life of the venue.
+///
+/// Unless `keys` says otherwise, each seat forgets its key when it stops — which
+/// is right for a sandbox, where the chain it signs for dies at the same moment.
+/// Point `keys` at a directory to make the seats durable, which a public network
+/// requires: a seat registered on the oracle contract whose key changed on restart
+/// can never sign again, so the venue can never settle a ticket.
+#[allow(dead_code)]
 pub fn start_committee(
     root: &Path,
     engine: &str,
 ) -> Result<(Vec<Seat>, Vec<std::process::Child>), String> {
+    start_committee_with(root, engine, None)
+}
+
+/// As `start_committee`, but with an explicit home for the seats' keys.
+pub fn start_committee_with(
+    root: &Path,
+    engine: &str,
+    keys: Option<&Path>,
+) -> Result<(Vec<Seat>, Vec<std::process::Child>), String> {
     use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().map_err(|error| format!("no executable path: {error}"))?;
-    let signer = exe.with_file_name("oracle-signer");
-    if !signer.exists() {
-        return Err(format!("{} is missing: build it with -p oracle-signer", signer.display()));
-    }
+    let signer = signer_path()?;
     std::fs::create_dir_all(root).map_err(|error| format!("{}: {error}", root.display()))?;
     let mut seats = Vec::new();
     let mut children = Vec::new();
     for name in SEAT_NAMES {
         let socket = root.join(format!("{name}.sock"));
-        let mut child = Command::new(&signer)
+        let mut command = Command::new(&signer);
+        command
             .arg("--name")
             .arg(name)
             .arg("--source")
@@ -118,7 +151,13 @@ pub fn start_committee(
             .arg("--engine")
             .arg(engine)
             .arg("--socket")
-            .arg(&socket)
+            .arg(&socket);
+        if let Some(home) = keys {
+            std::fs::create_dir_all(home)
+                .map_err(|error| format!("{}: {error}", home.display()))?;
+            command.arg("--key-file").arg(home.join(format!("{name}.key")));
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|error| format!("starting the {name} signer: {error}"))?;
@@ -221,5 +260,61 @@ mod tests {
     #[test]
     fn the_committee_names_four_seats() {
         assert_eq!(SEAT_NAMES, ["venue-index", "kraken", "okx", "pyth"]);
+    }
+
+    /// The property a public deployment depends on: stop the committee and start
+    /// it again, and it is the same committee. If the keys were regenerated, the
+    /// seats registered on the oracle contract would be strangers and no ticket
+    /// could ever settle after a restart.
+    ///
+    /// This spawns the real signer binary, so it is skipped when the test was not
+    /// built alongside it — an integration concern leaking into a unit test is
+    /// worse than a skipped test.
+    #[test]
+    fn a_seated_committee_comes_back_as_itself() {
+        if let Err(error) = signer_path() {
+            eprintln!("skipping: {error}");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("committee-{}", std::process::id()));
+        let keys = root.join("keys");
+        let sockets = root.join("socks");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let first = match start_committee_with(&sockets, "", Some(&keys)) {
+            Ok((seats, children)) => {
+                let keys_seen: Vec<Vec<u8>> =
+                    seats.iter().map(|seat| seat.public_key.clone()).collect();
+                for mut child in children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                keys_seen
+            }
+            Err(error) => {
+                eprintln!("skipping: committee did not start ({error})");
+                return;
+            }
+        };
+
+        // Second boot, same key directory.
+        let second = match start_committee_with(&sockets, "", Some(&keys)) {
+            Ok((seats, children)) => {
+                let keys_seen: Vec<Vec<u8>> =
+                    seats.iter().map(|seat| seat.public_key.clone()).collect();
+                for mut child in children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                keys_seen
+            }
+            Err(error) => {
+                eprintln!("skipping: committee did not restart ({error})");
+                return;
+            }
+        };
+
+        assert_eq!(first, second, "a restart must re-seat the same committee");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

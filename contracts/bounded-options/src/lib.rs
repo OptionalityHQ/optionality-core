@@ -74,6 +74,7 @@ const SERIES_STATE_BYTES: u64 = 344;
 /// A ladder quote is one `Quote` (16 bytes of payload) plus the map key.
 const QUOTE_STATE_BYTES: u64 = 88;
 /// A venue-published offer row: `Offer` plus its two index entries.
+#[allow(dead_code)]
 const OFFER_STATE_BYTES: u64 = 208;
 /// `near_sdk::env::storage_byte_cost()` is 10^19 yoctoNEAR per byte on both
 /// testnet and mainnet, but it is protocol configuration and not a constant we
@@ -2022,7 +2023,7 @@ impl Contract {
         );
         let refund = attached.as_yoctonear() - cost;
         if refund > 0 {
-            Promise::new(env::predecessor_account_id())
+            let _ = Promise::new(env::predecessor_account_id())
                 .transfer(NearToken::from_yoctonear(refund));
         }
     }
@@ -2348,6 +2349,13 @@ impl Contract {
             }),
         );
         fill
+    }
+
+    /// Read both sides of a ladder in one RPC round trip. Bounded to keep a
+    /// public gateway from making one request per side per visible cell.
+    pub fn get_books(&self, series_ids: Vec<u64>, limit: u8) -> Vec<(u64, Vec<BookOffer>, Vec<BidView>)> {
+        require!(series_ids.len() <= 32, "at most 32 books per call");
+        series_ids.into_iter().map(|id| (id, self.get_book(id, limit.min(20)), self.get_bids(id, limit.min(20)))).collect()
     }
 
     pub fn get_book(&self, series_id: u64, limit: u8) -> Vec<BookOffer> {

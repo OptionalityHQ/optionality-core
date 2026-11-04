@@ -12,3 +12,4 @@ bounded-core = { path = "../../core" }
 oracle-sources = { path = "../oracle-sources" }
 ed25519-dalek = "2.2.0"
 hex = "0.4"
+serde_json = "1"

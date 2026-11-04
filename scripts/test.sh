@@ -12,6 +12,7 @@ cargo test -p bounded-core
 cargo test -p surface
 cargo test -p bounded-options --lib
 cargo test -p price-oracle --lib
+cargo test -p mock-ft --lib
 cargo test -p engine
 cargo test -p integration-tests --test e2e -- --test-threads=1
 cargo test -p chain-host

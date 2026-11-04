@@ -20,6 +20,7 @@ mod activity;
 mod maker;
 mod operator;
 mod oracle;
+mod testnet;
 
 use near_workspaces::types::{Gas, NearToken};
 use near_workspaces::{Account, Contract};
@@ -619,6 +620,7 @@ async fn fund(env_admin: &Account, token: &Contract, options: &Contract, role: &
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(path) = optional("--testnet-session") { return testnet::run(&path).await; }
     let out = PathBuf::from(arg("--out", "data/chain-session.json"));
     // Read before the committee starts: the venue's own seat needs the engine's URL
     // to fetch its own index, and a seat is started before anything is listed.
@@ -659,9 +661,15 @@ async fn main() -> Result<()> {
     // inside the signer process that owns it — the relay that fetches prices can
     // ask for a signature and cannot make one, and venue.sh stops those
     // processes with the rest.
-    let (seats, signers) = oracle::start_committee(
+    //
+    // If the deployment is on a public network the seats get a key directory, so
+    // that stopping the host and starting it again re-seats the same committee
+    // rather than a set of strangers the oracle has never heard of.
+    let key_home = std::env::var("ORACLE_KEY_DIR").ok().filter(|dir| !dir.is_empty());
+    let (seats, signers) = oracle::start_committee_with(
         Path::new("data/oracle"),
         engine.as_deref().unwrap_or_default(),
+        key_home.as_deref().map(Path::new),
     )
     .map_err(|error| anyhow::anyhow!("starting the committee: {error}"))?;
     for seat in &seats {
