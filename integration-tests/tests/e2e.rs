@@ -4,6 +4,10 @@ use near_workspaces::{Account, AccountId, Contract, Worker};
 use serde_json::{json, Value};
 
 const SCALE: u128 = 1_000_000;
+/// Mirrors `SERIES_STATE_BYTES` in the options contract: what one series row
+/// costs, and the protocol's per-byte price. Over-attached; the contract refunds.
+const SERIES_RENT_BYTES: u128 = 344;
+const YOCTO_PER_BYTE: u128 = 10_000_000_000_000_000_000;
 const DEPOSIT: &str = "100000000"; // 100.000000
 
 const OPTIONS_WASM: &[u8] =
@@ -369,6 +373,9 @@ async fn create_series_with_floor(
             "min_confidence_bps": min_confidence_bps,
             "oracle_feed": "ETH-USD"
         }))
+        // The contract charges for the row it is about to write; the surplus is
+        // refunded. Without this a public deployment dies of storage rent.
+        .deposit(NearToken::from_yoctonear(SERIES_RENT_BYTES * YOCTO_PER_BYTE))
         .transact()
         .await?
         .into_result()?

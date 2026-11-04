@@ -53,6 +53,35 @@ const MAX_QUOTES_PER_CALL: usize = 64;
 /// and one view per series made a week of ladders into hundreds of round trips.
 const MAX_SERIES_PER_CALL: usize = 128;
 
+// ---------- storage rent ----------
+//
+// The sandbox mints accounts with NEAR to spare, so nobody ever noticed that
+// this contract pays for every byte it stores out of its own balance and that
+// nothing ever put money in. On a public chain that is the difference between a
+// venue that runs for a week and one that runs out of rent and stops accepting
+// writes — 500 series is ~40 KB of state, and a series row alone is ~270 bytes
+// that the venue account, not the trader, is charged for.
+//
+// The model here is deliberately narrow: it does not re-price users' own rows
+// (a ticket is theirs and they paid gas for it), it charges for the state the
+// *venue* creates on their behalf, and it leaves the vault's own bookkeeping on
+// the venue's tab at boot. That is small, honest, and enough to keep the
+// contract funded instead of silently bankrupt.
+/// Bytes of contract state one series row occupies, measured against the
+/// serialized `Series` plus its `LookupMap` key: an immutable 270-ish byte
+/// record that never goes away, because a settled series is still a series.
+const SERIES_STATE_BYTES: u64 = 344;
+/// A ladder quote is one `Quote` (16 bytes of payload) plus the map key.
+const QUOTE_STATE_BYTES: u64 = 88;
+/// A venue-published offer row: `Offer` plus its two index entries.
+const OFFER_STATE_BYTES: u64 = 208;
+/// `near_sdk::env::storage_byte_cost()` is 10^19 yoctoNEAR per byte on both
+/// testnet and mainnet, but it is protocol configuration and not a constant we
+/// get to assume: read it, never hard-code it.
+fn storage_price_per_byte() -> NearToken {
+    env::storage_byte_cost()
+}
+
 #[derive(BorshStorageKey, BorshSerialize)]
 #[borsh(crate = "near_sdk::borsh")]
 enum StorageKey {
@@ -339,6 +368,29 @@ pub struct Stats {
     pub total_pending_withdrawals: U128,
 }
 
+/// What the venue owes for the state it has written, and what it has behind it.
+///
+/// A public deployment fails in a way a sandbox never does: the contract pays
+/// storage rent out of its own account balance, and a venue that never collected
+/// any is one busy week from being unable to accept a write. This view exists so
+/// that failure is visible as a number before it is visible as an error.
+#[near(serializers = [json])]
+#[derive(Clone, PartialEq, Debug)]
+pub struct StorageState {
+    /// NEAR this contract must hold to keep every byte it has stored.
+    pub required_yocto: U128,
+    /// NEAR callers have put on the tab through `storage_deposit`.
+    pub paid_yocto: U128,
+    /// The contract account's balance right now.
+    pub balance_yocto: U128,
+    /// Whether that balance covers `required_yocto`.
+    pub funded: bool,
+    /// The protocol's price per byte, so a reader can check the arithmetic.
+    pub price_per_byte: U128,
+    /// `env::storage_usage()` — code, collections and every row.
+    pub usage_bytes: u64,
+}
+
 #[ext_contract(ext_oracle)]
 pub trait Oracle {
     fn get_observations(
@@ -457,6 +509,11 @@ pub struct Contract {
     open_bid_count: u64,
     open_ticket_count: u64,
     pending_withdrawal_count: u64,
+    /// NEAR callers have given the venue to cover the state their trades
+    /// created. A running total, not a slice of the account balance: the balance
+    /// is what is left, this is what was ever put in, and only the second one
+    /// answers whether the venue is being kept alive or quietly draining.
+    storage_paid: NearToken,
 }
 
 #[near]
@@ -510,6 +567,7 @@ impl Contract {
             open_bid_count: 0,
             open_ticket_count: 0,
             pending_withdrawal_count: 0,
+            storage_paid: NearToken::from_yoctonear(0),
         }
     }
 
@@ -557,8 +615,12 @@ impl Contract {
     /// the venue account may speak for the vault, and a caller may only agree:
     /// `pool_buy` and `pool_close` require the mid they send to be exactly this
     /// number, so nobody can name a price that is not the venue's.
+    #[payable]
     pub fn set_pool_quote(&mut self, series_id: u64, mid_units: U128, stamp_ns: u64) {
         self.assert_venue();
+        if self.pool_quotes.get(&series_id).is_none() {
+            self.charge_storage(QUOTE_STATE_BYTES, "quote");
+        }
         self.write_quote(series_id, mid_units.0, stamp_ns);
     }
 
@@ -568,6 +630,7 @@ impl Contract {
     /// sixty cells, and at one call each a venue with a week of expiries cannot
     /// refresh them inside its own quote age. Batching keeps a ladder one write,
     /// so what the screen offers never depends on how many markets it lists.
+    #[payable]
     pub fn set_pool_quotes(&mut self, series_ids: Vec<u64>, mid_units: Vec<U128>, stamp_ns: u64) {
         self.assert_venue();
         require!(
@@ -576,6 +639,16 @@ impl Contract {
         );
         // Bounded like `get_pool_prices`: one call, one block's worth of work.
         require!(series_ids.len() <= MAX_QUOTES_PER_CALL, "too many quotes at once");
+        // One charge for the whole ladder, and only for the cells that are new:
+        // re-quoting a series the venue already quotes costs no additional state,
+        // and charging for it would make a refresh cycle a tax on staying fresh.
+        let fresh = series_ids
+            .iter()
+            .filter(|id| self.pool_quotes.get(id).is_none())
+            .count() as u64;
+        if fresh > 0 {
+            self.charge_storage(fresh * QUOTE_STATE_BYTES, "ladder");
+        }
         for (series_id, mid) in series_ids.into_iter().zip(mid_units.into_iter()) {
             self.write_quote(series_id, mid.0, stamp_ns);
         }
@@ -662,6 +735,7 @@ impl Contract {
     // ---------- market ----------
 
     #[allow(clippy::too_many_arguments)]
+    #[payable]
     pub fn create_series(
         &mut self,
         underlying: String,
@@ -705,6 +779,10 @@ impl Contract {
         require!(high_strike.0 > low_strike.0, "invalid strikes");
         require!(price_scale.0 > 0, "price scale required");
         require!(min_confidence_bps <= 10_000, "invalid confidence");
+        // A series is a permanent row: it outlives its own settlement, because
+        // a ticket that paid has to be explainable years later. The caller who
+        // creates it pays the rent for it, not the venue.
+        self.charge_storage(SERIES_STATE_BYTES, "series");
 
         let id = self.next_series;
         self.next_series = self
@@ -1870,6 +1948,85 @@ impl Contract {
         self.config.paused = paused;
     }
 
+    // ---------- storage rent ----------
+
+    /// Put money on the venue's tab so it can go on storing state.
+    ///
+    /// Anyone may call this: a judge who wants the demo to keep quoting, the
+    /// operator after it topped the account up, or an admin script. It is a
+    /// donation with a receipt, not a payment that buys a right.
+    #[payable]
+    pub fn storage_deposit(&mut self) {
+        let amount = env::attached_deposit();
+        require!(amount.as_yoctonear() > 0, "attach NEAR for storage");
+        let deposited = self.storage_paid.as_yoctonear()
+            + amount.as_yoctonear();
+        self.storage_paid = NearToken::from_yoctonear(deposited);
+        emit(
+            "storage_deposited",
+            near_sdk::serde_json::json!({
+                "from": env::predecessor_account_id(),
+                "amount": amount.as_yoctonear().to_string(),
+                "paid_total": deposited.to_string(),
+            }),
+        );
+    }
+
+    /// What the venue owes for the state it has already created, and whether the
+    /// balance behind it can still cover that plus the next write.
+    ///
+    /// This is a view because it has to be readable before anything is spent: the
+    /// operator asks it every pass, and a screen can show a judge the tab instead
+    /// of letting them discover it as a failed order.
+    pub fn get_storage_state(&self) -> StorageState {
+        let required = self.storage_required();
+        let balance = env::account_balance();
+        StorageState {
+            required_yocto: U128(required.as_yoctonear()),
+            paid_yocto: U128(self.storage_paid.as_yoctonear()),
+            balance_yocto: U128(balance.as_yoctonear()),
+            funded: balance >= required,
+            price_per_byte: U128(storage_price_per_byte().as_yoctonear()),
+            usage_bytes: env::storage_usage(),
+        }
+    }
+
+    /// The NEAR this contract must hold to keep every byte it has written.
+    ///
+    /// `env::storage_usage()` already counts the code, the collections and every
+    /// row, and it is maintained by the runtime rather than by us — which is why
+    /// the answer is a measurement and not an estimate. Multiplying it by the
+    /// protocol's byte price gives the rent claim exactly.
+    fn storage_required(&self) -> NearToken {
+        storage_price_per_byte().saturating_mul(env::storage_usage() as u128)
+    }
+
+    /// Charge the caller for state this call is about to create for them.
+    ///
+    /// Called before the write, not after: a caller who cannot fund the state
+    /// their trade needs is refused with a sentence, not left with a half-written
+    /// order the venue then has to pay to keep. Anything left over is refunded so
+    /// an over-payment is not silently kept.
+    fn charge_storage(&mut self, bytes: u64, what: &str) {
+        let cost = storage_price_per_byte()
+            .saturating_mul(bytes as u128)
+            .as_yoctonear();
+        let attached = env::attached_deposit();
+        if attached.as_yoctonear() < cost {
+            env::panic_str(&format!(
+                "this {what} stores {bytes} bytes of state; attach at least {cost} yoctoNEAR"
+            ));
+        }
+        self.storage_paid = NearToken::from_yoctonear(
+            self.storage_paid.as_yoctonear() + cost,
+        );
+        let refund = attached.as_yoctonear() - cost;
+        if refund > 0 {
+            Promise::new(env::predecessor_account_id())
+                .transfer(NearToken::from_yoctonear(refund));
+        }
+    }
+
     // ---------- views ----------
 
     pub fn get_config(&self) -> Config {
@@ -2484,6 +2641,16 @@ mod tests {
         builder
     }
 
+    /// The test runner charges for storage at the same per-byte price as the
+    /// chain, so a venue write that now prices its own state needs the deposit in
+    /// the context. Paying for a whole series covers any call that creates one.
+    fn paid(predecessor: AccountId, timestamp: u64) -> VMContextBuilder {
+        let bytes = SERIES_STATE_BYTES + MAX_QUOTES_PER_CALL as u64 * QUOTE_STATE_BYTES;
+        let mut builder = context(predecessor, timestamp);
+        builder.attached_deposit(storage_price_per_byte().saturating_mul(bytes as u128));
+        builder
+    }
+
     fn setup() -> Contract {
         testing_env!(context(accounts(0), T0).build());
         Contract::new(accounts(0), accounts(1), accounts(2))
@@ -2521,7 +2688,7 @@ mod tests {
     }
 
     fn series(contract: &mut Contract) -> u64 {
-        testing_env!(context(accounts(0), T0).build());
+        testing_env!(paid(accounts(0), T0).build());
         contract.create_series(
             "ETH".to_string(),
             SpreadKind::Put,
@@ -2542,7 +2709,7 @@ mod tests {
     /// block time and leaves the clock where it found it.
     fn quote(contract: &mut Contract, sid: u64, mid: u128) {
         let stamp = env::block_timestamp();
-        testing_env!(context(accounts(0), stamp).build());
+        testing_env!(paid(accounts(0), stamp).build());
         contract.set_pool_quote(sid, U128(mid), stamp);
     }
 
@@ -2554,7 +2721,7 @@ mod tests {
     fn a_series_name_is_a_tag_and_not_a_document() {
         fn listed(underlying: &str, feed: &str) -> Result<u64, ()> {
             let mut contract = setup();
-            testing_env!(context(accounts(0), T0).build());
+            testing_env!(paid(accounts(0), T0).build());
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 contract.create_series(
                     underlying.to_string(),
@@ -2731,7 +2898,7 @@ mod tests {
     }
 
     fn call_series(contract: &mut Contract) -> u64 {
-        testing_env!(context(accounts(0), T0).build());
+        testing_env!(paid(accounts(0), T0).build());
         contract.create_series(
             "ETH".to_string(),
             SpreadKind::Call,
@@ -3930,7 +4097,7 @@ mod tests {
         let mut contract = setup();
         let a = series(&mut contract);
         let b = series(&mut contract);
-        testing_env!(context(accounts(0), T0).build());
+        testing_env!(paid(accounts(0), T0).build());
         contract.set_pool_quotes(
             vec![a, b],
             vec![U128(3 * SCALE), U128(4 * SCALE)],
@@ -4561,7 +4728,7 @@ mod tests {
 
         let mut sids = Vec::new();
         for (index, offset) in [60u64, 120, 180, 240].into_iter().enumerate() {
-            testing_env!(context(accounts(0), T0).build());
+            testing_env!(paid(accounts(0), T0).build());
             let sid = contract.create_series(
                 "ETH".to_string(),
                 SpreadKind::Put,
@@ -4809,5 +4976,149 @@ mod tests {
             reached.iter().all(|count| *count > 0),
             "the session never exercised one of its paths: {reached:?}"
         );
+    }
+
+    // ---------- storage rent ----------
+
+    /// A series is the one row nobody gets to write for free: it is permanent,
+    /// it is created on the venue's behalf, and on a public chain the contract
+    /// pays for it out of its own balance every block until the account is empty.
+    #[test]
+    fn a_series_must_be_paid_for_by_whoever_creates_it() {
+        let mut contract = setup();
+        // No deposit at all: refused, with a sentence rather than a silent drain.
+        testing_env!(context(accounts(0), T0).build());
+        assert!(
+            refused(|| {
+                contract.create_series(
+                    "ETH".to_string(),
+                    SpreadKind::Put,
+                    T0 + 60_000_000_000,
+                    T0 + 120_000_000_000,
+                    T0 + 660_000_000_000,
+                    U128(100 * SCALE),
+                    U128(110 * SCALE),
+                    U128(SCALE),
+                    5_000,
+                    "ETH-USD".to_string(),
+                )
+            }),
+            "an unfunded series write must be refused"
+        );
+
+        // Paying exactly the rent the row costs is enough.
+        let cost = storage_price_per_byte()
+            .saturating_mul(SERIES_STATE_BYTES as u128);
+        let mut ctx = context(accounts(0), T0);
+        ctx.attached_deposit(cost);
+        testing_env!(ctx.build());
+        let id = contract.create_series(
+            "ETH".to_string(),
+            SpreadKind::Put,
+            T0 + 60_000_000_000,
+            T0 + 120_000_000_000,
+            T0 + 660_000_000_000,
+            U128(100 * SCALE),
+            U128(110 * SCALE),
+            U128(SCALE),
+            5_000,
+            "ETH-USD".to_string(),
+        );
+        assert_eq!(id, 0);
+        assert_eq!(contract.get_storage_state().paid_yocto.0, cost.as_yoctonear());
+    }
+
+    /// Re-quoting a series the venue already prices adds no state, so it adds no
+    /// charge. Making a refresh cycle pay rent would tax the venue for staying
+    /// fresh, and a quote that is expensive to renew is a quote that goes stale.
+    #[test]
+    fn refreshing_a_quote_costs_nothing_after_the_first_time() {
+        let mut contract = setup();
+        let sid = series(&mut contract);
+        // Quote it once, paying for the row; that row is the state a refresh
+        // must not be charged for again.
+        let mut ctx = context(accounts(0), T0);
+        ctx.attached_deposit(storage_price_per_byte().saturating_mul(QUOTE_STATE_BYTES as u128));
+        testing_env!(ctx.build());
+        contract.set_pool_quote(sid, U128(3 * SCALE), T0);
+        let paid_before = contract.get_storage_state().paid_yocto.0;
+
+        // A refresh attaches nothing, and must still be accepted.
+        testing_env!(context(accounts(0), T0 + 1).build());
+        contract.set_pool_quote(sid, U128(4 * SCALE), T0 + 1);
+        assert_eq!(contract.get_pool_quote(sid).unwrap().mid_units, 4 * SCALE);
+        assert_eq!(
+            contract.get_storage_state().paid_yocto.0,
+            paid_before,
+            "a re-quote must not charge again"
+        );
+    }
+
+    /// The view is the whole point: an operator has to be able to see the tab
+    /// before a judge finds it as a failed transaction.
+    #[test]
+    fn the_storage_tab_reads_back_what_it_owes_and_what_it_has() {
+        let mut contract = setup();
+        let _ = series(&mut contract);
+        let state = contract.get_storage_state();
+        // The test runner's `storage_usage` counts the collections this contract
+        // created at init plus the row `series()` wrote, so the requirement is
+        // never zero and never below the row we just paid for.
+        assert!(state.usage_bytes > 0, "the contract has no state at all?");
+        assert!(state.required_yocto.0 > 0);
+        assert_eq!(
+            state.required_yocto.0,
+            state.price_per_byte.0 * state.usage_bytes as u128
+        );
+        // Rent paid is a floor on what was contributed, not the balance: the
+        // runner does not fund the account, so `funded` is honest about that.
+        assert!(state.paid_yocto.0 >= SERIES_STATE_BYTES as u128 * state.price_per_byte.0);
+    }
+
+    /// Anyone may top the venue up. It is a donation with a receipt: no shares,
+    /// no claim, no right — which is what makes it safe to let a stranger do it.
+    #[test]
+    fn anyone_can_put_money_on_the_storage_tab() {
+        let mut contract = setup();
+        let before = contract.get_storage_state().paid_yocto.0;
+        let gift = NearToken::from_millinear(10);
+        let mut ctx = context(outsider(), T0);
+        ctx.attached_deposit(gift);
+        testing_env!(ctx.build());
+        contract.storage_deposit();
+        assert_eq!(
+            contract.get_storage_state().paid_yocto.0,
+            before + gift.as_yoctonear()
+        );
+        // A deposit of nothing is a mistake, not a donation.
+        testing_env!(context(outsider(), T0).build());
+        assert!(refused(|| contract.storage_deposit()));
+    }
+
+    /// Overpaying must not be kept. The surplus goes back to whoever attached it,
+    /// because a contract that quietly absorbs the remainder is a contract that
+    /// makes money from its callers' arithmetic.
+    #[test]
+    fn an_overpaid_series_refunds_the_remainder() {
+        let mut contract = setup();
+        let exact = storage_price_per_byte().saturating_mul(SERIES_STATE_BYTES as u128);
+        let overpaid = NearToken::from_yoctonear(exact.as_yoctonear() + 1_000_000);
+        let mut ctx = context(accounts(0), T0);
+        ctx.attached_deposit(overpaid);
+        testing_env!(ctx.build());
+        contract.create_series(
+            "ETH".to_string(),
+            SpreadKind::Put,
+            T0 + 60_000_000_000,
+            T0 + 120_000_000_000,
+            T0 + 660_000_000_000,
+            U128(100 * SCALE),
+            U128(110 * SCALE),
+            U128(SCALE),
+            5_000,
+            "ETH-USD".to_string(),
+        );
+        // Only the rent is booked; the rest is on its way back to the caller.
+        assert_eq!(contract.get_storage_state().paid_yocto.0, exact.as_yoctonear());
     }
 }

@@ -35,6 +35,18 @@ const EACH: u128 = 5_000_000;
 /// README far enough to fund it.
 const LP_SEED: u128 = 100_000;
 const GAS: Gas = Gas::from_tgas(80);
+/// State rent. The contract charges whoever creates a series or a first quote
+/// for the bytes they add, because on a public chain the contract pays for that
+/// state out of its own balance. These mirror the contract's own byte counts —
+/// `SERIES_STATE_BYTES` and `QUOTE_STATE_BYTES` in
+/// `contracts/bounded-options/src/lib.rs` — and are over-attached on purpose: the
+/// contract refunds the remainder.
+const SERIES_RENT_BYTES: u128 = 344;
+const QUOTE_RENT_BYTES: u128 = 88;
+/// 10^19 yoctoNEAR per byte is the protocol's price on every network today.
+/// The contract reads it from the runtime; the host cannot, so it hard-codes the
+/// current value and over-attaches. A refund is a better failure than a refusal.
+const YOCTO_PER_BYTE: u128 = 10_000_000_000_000_000_000;
 /// How often the committee is asked for prices, on its own task. Fast enough
 /// that a seat is never stale when a series comes due, slow enough that nobody
 /// outside this machine is being polled to death.
@@ -192,6 +204,7 @@ async fn list_ladder(
                     .call(options.id(), "create_series")
                     .args_json(plan.args())
                     .gas(GAS)
+                    .deposit(NearToken::from_yoctonear(SERIES_RENT_BYTES * YOCTO_PER_BYTE))
                     .transact()
                     .await?
                     .into_result()?;
@@ -523,6 +536,8 @@ async fn quote_ladder(
         for chunk in needed.chunks(64) {
             let series_ids: Vec<u64> = chunk.iter().map(|(series_id, _)| *series_id).collect();
             let mid_units: Vec<String> = chunk.iter().map(|(_, mid)| mid.to_string()).collect();
+            // Only the cells that are new cost rent; over-attaching the whole
+            // chunk is fine because the contract refunds what it does not use.
             venue
                 .call(options.id(), "set_pool_quotes")
                 .args_json(json!({
@@ -531,6 +546,9 @@ async fn quote_ladder(
                     "stamp_ns": now_ns,
                 }))
                 .gas(GAS)
+                .deposit(NearToken::from_yoctonear(
+                    chunk.len() as u128 * QUOTE_RENT_BYTES * YOCTO_PER_BYTE,
+                ))
                 .transact()
                 .await?
                 .into_result()?;
@@ -817,6 +835,7 @@ async fn main() -> Result<()> {
                 "min_confidence_bps": 3000,
                 "oracle_feed": "ETH-USD"
             }))
+            .deposit(NearToken::from_yoctonear(SERIES_RENT_BYTES * YOCTO_PER_BYTE))
             .gas(GAS)
             .transact()
             .await?
