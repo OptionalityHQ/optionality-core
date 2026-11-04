@@ -73,43 +73,45 @@ bash scripts/build.sh
 
 say "==> 2/8 creating subaccounts"
 for account in "$TOKEN_ID" "$ORACLE_ID" "$OPTIONS_ID"; do
-  if near state "$account" --networkId "$NETWORK" >/dev/null 2>&1; then
+  if near state "$account" --network-id "$NETWORK" >/dev/null 2>&1; then
     say "    $account exists, leaving it alone"
   else
-    near create-account "$account" --masterAccount "$VENUE" \
-      --initialBalance 10 --networkId "$NETWORK"
+    near create-account "$account" --use-account "$VENUE" \
+      --initial-balance 10 --network-id "$NETWORK"
   fi
 done
 
 say "==> 3/8 deploying the mock token"
+# Signed with the venue's key, which `near` reads from its credentials store;
+# there is no --use-account on `deploy`.
 near deploy "$TOKEN_ID" "$WASM_DIR/mock_ft/mock_ft.wasm" \
-  --initFunction new \
-  --initArgs "{\"owner\":\"$VENUE\"}" \
-  --initGas "$GAS" \
-  --accountId "$VENUE" --networkId "$NETWORK"
+  --init-function new \
+  --init-args "{\"owner\":\"$VENUE\"}" \
+  --init-gas "$GAS" \
+  --network-id "$NETWORK"
 
 say "==> 4/8 deploying the oracle"
 near deploy "$ORACLE_ID" "$WASM_DIR/price_oracle/price_oracle.wasm" \
-  --initFunction new \
-  --initArgs "{\"owner\":\"$VENUE\"}" \
-  --initGas "$GAS" \
-  --accountId "$VENUE" --networkId "$NETWORK"
+  --init-function new \
+  --init-args "{\"owner\":\"$VENUE\"}" \
+  --init-gas "$GAS" \
+  --network-id "$NETWORK"
 
 say "==> 5/8 deploying the options contract"
 near deploy "$OPTIONS_ID" "$WASM_DIR/bounded_options/bounded_options.wasm" \
-  --initFunction new \
-  --initArgs "{\"admin\":\"$VENUE\",\"token\":\"$TOKEN_ID\",\"oracle\":\"$ORACLE_ID\"}" \
-  --initGas "$GAS" \
-  --accountId "$VENUE" --networkId "$NETWORK"
+  --init-function new \
+  --init-args "{\"admin\":\"$VENUE\",\"token\":\"$TOKEN_ID\",\"oracle\":\"$ORACLE_ID\"}" \
+  --init-gas "$GAS" \
+  --network-id "$NETWORK"
 
 say "==> 6/8 naming the venue and its fee schedule"
 # The operator quotes as the venue account; the contract refuses anyone else.
 near call "$OPTIONS_ID" set_venue "{\"venue\":\"$VENUE\"}" \
-  --accountId "$VENUE" --gas "$GAS" --networkId "$NETWORK"
+  --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
 # 0.5% over mid to open, 1% under mid to close — the sandbox's schedule, and
 # honest about being a demo fee rather than a market one.
 near call "$OPTIONS_ID" set_fee_terms '{"margin_bps":50,"impact_bps":100}' \
-  --accountId "$VENUE" --gas "$GAS" --networkId "$NETWORK"
+  --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
 
 say "==> 7/8 the settlement committee"
 # Seats live on the ORACLE contract, not the options contract, and a seat is a
@@ -129,10 +131,10 @@ if [ -d "$SEATS_DIR" ] && ls "$SEATS_DIR"/*.json >/dev/null 2>&1; then
   for seat in "$SEATS_DIR"/*.json; do
     say "    registering $(basename "$seat" .json)"
     near call "$ORACLE_ID" add_source "$(cat "$seat")" \
-      --accountId "$VENUE" --gas "$GAS" --networkId "$NETWORK"
+      --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
   done
   near call "$ORACLE_ID" set_quorum '{"quorum":2}' \
-    --accountId "$VENUE" --gas "$GAS" --networkId "$NETWORK"
+    --use-account "$VENUE" --gas "$GAS" --network-id "$NETWORK"
 else
   say "    no seat keys in $SEATS_DIR — SKIPPING."
   say ""
@@ -172,7 +174,7 @@ say "    data/testnet-session.json"
 say ""
 say "done. read the storage tab first — a venue that cannot pay rent is a venue"
 say "that stops accepting writes:"
-say "  near view $OPTIONS_ID get_storage_state"
+say "  near view $OPTIONS_ID get_storage_state --network-id $NETWORK"
 say ""
 say "if 'funded' is false, anyone can top it up:"
-say "  near call $OPTIONS_ID storage_deposit '{}' --accountId $VENUE --deposit 1"
+say "  near call $OPTIONS_ID storage_deposit '{}' --use-account $VENUE --deposit 1 --network-id $NETWORK"
