@@ -1,0 +1,12 @@
+[package]
+name = "confidential-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+outlayer = { version = "0.2.1", features = ["encryption-keys", "signing-keys"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"

@@ -24,7 +24,7 @@ children+=("$!")
 ./target/debug/chain-host --testnet-session "$SESSION" --credentials "$CREDENTIALS" \
   --engine "http://127.0.0.1:$ENGINE_PORT" --assets ETH,BTC --max-expiries "${MAX_EXPIRIES:-2}" > logs/testnet-operator.log 2>&1 &
 children+=("$!")
-NEAR_ADMIN_CREDENTIALS="$CREDENTIALS" node api/src/server.ts --session "$SESSION" \
+NEAR_ADMIN_CREDENTIALS="$CREDENTIALS" node --env-file-if-exists=.env api/src/server.ts --session "$SESSION" \
   --engine "http://127.0.0.1:$ENGINE_PORT" --port "$GATEWAY_PORT" --host "${GATEWAY_HOST:-127.0.0.1}" --public-origin "${PUBLIC_ORIGIN:-http://127.0.0.1:$GATEWAY_PORT}" > logs/testnet-gateway.log 2>&1 &
 children+=("$!")
 printf '%s\n' "${children[@]}" > data/private/testnet.pids

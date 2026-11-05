@@ -4,10 +4,13 @@ members = [
     "contracts/mock-ft",
     "contracts/price-oracle",
     "core",
+    "private-ledger",
+    "confidential-protocol",
     "engine",
     "surface",
     "integration-tests",
     "tools/chain-host",
+    "tools/confidential-worker",
     "tools/oracle-signer",
     "tools/oracle-sources",
 ]

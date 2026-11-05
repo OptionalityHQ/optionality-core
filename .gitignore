@@ -6,3 +6,11 @@ sim/.bundle-check.mjs
 /data/private/
 /demo/wallet.js
 /demo/wallet.css
+
+/demo/positions-chart.js
+
+.env
+
+.env.*
+
+!.env.example

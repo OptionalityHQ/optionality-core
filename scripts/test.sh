@@ -9,6 +9,8 @@ cd "$(dirname "$0")/.."
 
 ./scripts/build.sh
 cargo test -p bounded-core
+cargo test -p private-ledger
+cargo test -p confidential-protocol
 cargo test -p surface
 cargo test -p bounded-options --lib
 cargo test -p price-oracle --lib
