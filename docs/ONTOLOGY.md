@@ -1,9 +1,9 @@
-# Optionality Protocol — Source-Grounded Semantic Ontology
+# Optionality Protocol: Source-Grounded Semantic Ontology
 
 > Modeled using the **Auto-Ontology** source-grounded methodology: Question Contracts, Entity Terms with exact physical source bindings, Relationship Contracts with cardinality and fanout guarantees, and Certified Measure Contracts with explicit units, grains, and counterexamples.
 
 <p align="center">
-  <img src="./assets/ontology-graph.svg" alt="Optionality Semantic Ontology Graph" width="900" />
+  <img src="./assets/ontology-graph.png" alt="Optionality Semantic Ontology Graph" width="900" />
 </p>
 
 ---
@@ -25,13 +25,13 @@ Before any UI panel, API route, or MCP tool answers a trader or agent question, 
 
 | Term | Business Definition | Physical Source Binding | Primary Key & Grain | Unit / Encoding |
 | :--- | :--- | :--- | :--- | :--- |
-| **`Series`** | A bounded European call or put spread with fixed floor strike $K_{\text{low}}$, cap strike $K_{\text{high}}$, and expiry $T$. | `core::contracts/bounded-options/src/types.rs::Series` | `series_id: u64` — 1 row per `(underlying, kind, expiry_ns, low_strike, high_strike)` | Strikes in $u_6$ USD atoms ($10^6 = \$1.00$); timestamps in nanoseconds (`u64`). |
-| **`Ticket`** | An on-chain option position minted to a trader upon buying from the LP Pool Vault or matching a resting ask on the order book. | `core::contracts/bounded-options/src/types.rs::Ticket` | `ticket_id: u64` — 1 row per position issuance | `size` in $10^{-4}$ fractional contract lots ($10{,}000 = 1.0000\text{ ct}$); `paid` in $u_6$ USDT atoms. |
+| **`Series`** | A bounded European call or put spread with fixed floor strike $K_{\text{low}}$, cap strike $K_{\text{high}}$, and expiry $T$. | `core::contracts/bounded-options/src/types.rs::Series` | `series_id: u64`: 1 row per `(underlying, kind, expiry_ns, low_strike, high_strike)` | Strikes in $u_6$ USD atoms ($10^6 = \$1.00$); timestamps in nanoseconds (`u64`). |
+| **`Ticket`** | An on-chain option position minted to a trader upon buying from the LP Pool Vault or matching a resting ask on the order book. | `core::contracts/bounded-options/src/types.rs::Ticket` | `ticket_id: u64`: 1 row per position issuance | `size` in $10^{-4}$ fractional contract lots ($10{,}000 = 1.0000\text{ ct}$); `paid` in $u_6$ USDT atoms. |
 | **`PoolVault`** | Unified NEP-141 USDT liquidity pool that quotes two-sided spread markets and locks 100% of maximum spread payout at trade inception. | `core::contracts/bounded-options/src/lib.rs::Contract` | Singleton per deployment (`free_liquidity`, `locked_collateral`, `lp_shares`) | $u_6$ USDT atoms (`u128`). |
 | **`RestingOrder`** | A limit bid or collateralized limit ask resting on a series order book. | `core::contracts/bounded-options/src/types.rs::Order` | `(series_id: u64, order_id: u64)` | `price_per_unit` in $u_6$ USDT atoms per contract. |
 | **`OracleCommittee`** | Four independent market-data signers (Pyth, Kraken, OKX, Venue Index), each running in an isolated OS process with its own Ed25519 key. | `core::contracts/price-oracle/src/lib.rs::PriceOracle` | `(feed_id: String, signer: AccountId)` | Price in $u_6$ USD atoms; confidence in basis points (`u16`). |
 | **`WalletSubaccount`** | Dedicated on-chain NEAR subaccount provisioned per external wallet so balances, open tickets, and trade histories are strictly isolated. | `adapter::api/src/chain.ts::Chain::ensureWalletRole` | `w-<slug>-<hash4>.<admin>` mapped 1:1 to `displayAccount` | $u_6$ USDT venue balance + NEAR gas allowance. |
-| **`CopyMandate`** | Confidential copy-trading subscription linking a follower to a leader strategy with 1Click/NEAR Intents Ed25519-verified shielded funding. | `core::private-ledger/src/lib.rs` & `adapter::api/src/copy-trading.ts` | `mandate_id: String` — 1 row per `(follower, leader_id)` | Allocation in USD; max drawdown in bps. |
+| **`CopyMandate`** | Confidential copy-trading subscription linking a follower to a leader strategy with 1Click/NEAR Intents Ed25519-verified shielded funding. | `core::private-ledger/src/lib.rs` & `adapter::api/src/copy-trading.ts` | `mandate_id: String`: 1 row per `(follower, leader_id)` | Allocation in USD; max drawdown in bps. |
 
 ---
 

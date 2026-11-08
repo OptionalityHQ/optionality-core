@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 420" width="100%" height="420">
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 420" width="1100" height="420">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="#c6f24e"/>
@@ -8,48 +9,45 @@
     </marker>
   </defs>
   <rect width="1100" height="420" rx="14" fill="#0a0f14" stroke="#22303c" stroke-width="2"/>
-  <text x="36" y="40" fill="#f4ede4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700" letter-spacing="0.8">OPTIONALITY PROTOCOL · END-TO-END SYSTEM ARCHITECTURE</text>
+  <text x="36" y="40" fill="#f4ede4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700" letter-spacing="0.8">OPTIONALITY PROTOCOL : END-TO-END SYSTEM ARCHITECTURE</text>
 
-  <!-- Column 1: Interface -->
   <rect x="32" y="66" width="280" height="320" rx="10" fill="#101820" stroke="#2b3b4b" stroke-width="1.5"/>
-  <text x="52" y="96" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700">1. OPTIONALITYHQ / INTERFACE</text>
+  <text x="52" y="96" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700">1. OPTIONALITY-INTERFACE</text>
   <rect x="52" y="114" width="240" height="58" rx="6" fill="#0b1117" stroke="#233240"/>
-  <text x="66" y="138" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Options Board &amp; Volatility Smile</text>
-  <text x="66" y="158" fill="#8b98a5" font-family="monospace" font-size="11">Strike Ladder · Call/Put Spreads</text>
+  <text x="66" y="138" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Options Board and IV Smile</text>
+  <text x="66" y="158" fill="#8b98a5" font-family="monospace" font-size="11">Strike Ladder : Call/Put Spreads</text>
 
   <rect x="52" y="186" width="240" height="68" rx="6" fill="#0b1117" stroke="#233240"/>
   <text x="66" y="210" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">2D Interactive Positions Chart</text>
-  <text x="66" y="228" fill="#8b98a5" font-family="monospace" font-size="11">Draggable Orders · Break-Even Line</text>
-  <text x="66" y="244" fill="#5fc39c" font-family="monospace" font-size="11">Custom Expiry · USDT/Contract Size</text>
+  <text x="66" y="228" fill="#8b98a5" font-family="monospace" font-size="11">Draggable Orders : Break-Even Line</text>
+  <text x="66" y="244" fill="#5fc39c" font-family="monospace" font-size="11">Custom Expiry : USDT/Contract Size</text>
 
   <rect x="52" y="268" width="240" height="96" rx="6" fill="#0b1117" stroke="#233240"/>
-  <text x="66" y="292" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">NEAR Wallet Selector &amp; Copy UI</text>
-  <text x="66" y="312" fill="#8b98a5" font-family="monospace" font-size="11">Meteor Wallet · MyNearWallet</text>
+  <text x="66" y="292" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">NEAR Wallet Selector and Copy UI</text>
+  <text x="66" y="312" fill="#8b98a5" font-family="monospace" font-size="11">Meteor Wallet : MyNearWallet</text>
   <text x="66" y="330" fill="#8b98a5" font-family="monospace" font-size="11">Isolated Sandbox Subaccounts</text>
   <text x="66" y="348" fill="#c6f24e" font-family="monospace" font-size="11">1Click Shielded Funding Preview</text>
 
-  <!-- Column 2: Adapter -->
   <rect x="380" y="66" width="300" height="320" rx="10" fill="#101820" stroke="#2b3b4b" stroke-width="1.5"/>
-  <text x="400" y="96" fill="#5fc39c" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700">2. OPTIONALITYHQ / ADAPTER</text>
+  <text x="400" y="96" fill="#5fc39c" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700">2. OPTIONALITY-ADAPTER</text>
   <rect x="400" y="114" width="260" height="64" rx="6" fill="#0b1117" stroke="#233240"/>
-  <text x="414" y="138" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">TypeScript HTTP &amp; RPC Gateway</text>
-  <text x="414" y="156" fill="#8b98a5" font-family="monospace" font-size="11">/state · /action · /plan · /faucet</text>
+  <text x="414" y="138" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">TypeScript HTTP and RPC Gateway</text>
+  <text x="414" y="156" fill="#8b98a5" font-family="monospace" font-size="11">/state : /action : /plan : /faucet</text>
   <text x="414" y="171" fill="#8b98a5" font-family="monospace" font-size="11">Per-Wallet Subaccount Isolation</text>
 
   <rect x="400" y="192" width="260" height="64" rx="6" fill="#0b1117" stroke="#233240"/>
-  <text x="414" y="216" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Confidential Intents &amp; Copy Engine</text>
+  <text x="414" y="216" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Confidential Intents and Copy Engine</text>
   <text x="414" y="234" fill="#8b98a5" font-family="monospace" font-size="11">Ed25519 Quote Verification</text>
-  <text x="414" y="249" fill="#8b98a5" font-family="monospace" font-size="11">TEE Mandate &amp; Journal Sequencer</text>
+  <text x="414" y="249" fill="#8b98a5" font-family="monospace" font-size="11">TEE Mandate and Journal Sequencer</text>
 
   <rect x="400" y="270" width="260" height="94" rx="6" fill="#0b1117" stroke="#233240"/>
   <text x="414" y="294" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">MCP Agent Server (mcp/index.mjs)</text>
-  <text x="414" y="314" fill="#8b98a5" font-family="monospace" font-size="11">list_expiries · get_smile</text>
-  <text x="414" y="332" fill="#8b98a5" font-family="monospace" font-size="11">quote_spread · build_transaction</text>
+  <text x="414" y="314" fill="#8b98a5" font-family="monospace" font-size="11">list_expiries : get_smile</text>
+  <text x="414" y="332" fill="#8b98a5" font-family="monospace" font-size="11">quote_spread : build_transaction</text>
   <text x="414" y="350" fill="#5fc39c" font-family="monospace" font-size="11">Ontology-Grounded Agent Tools</text>
 
-  <!-- Column 3: Core -->
   <rect x="748" y="66" width="320" height="320" rx="10" fill="#101820" stroke="#2b3b4b" stroke-width="1.5"/>
-  <text x="768" y="96" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700">3. OPTIONALITYHQ / CORE</text>
+  <text x="768" y="96" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700">3. OPTIONALITY-CORE</text>
   <rect x="768" y="114" width="280" height="76" rx="6" fill="#0b1117" stroke="#233240"/>
   <text x="782" y="138" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">NEAR Smart Contracts (Wasm)</text>
   <text x="782" y="156" fill="#c6f24e" font-family="monospace" font-size="11">bounded-options (Pool + CLOB)</text>
@@ -57,16 +55,15 @@
   <text x="782" y="186" fill="#8b98a5" font-family="monospace" font-size="11">mock-ft (NEP-141 USDT Token)</text>
 
   <rect x="768" y="202" width="280" height="72" rx="6" fill="#0b1117" stroke="#233240"/>
-  <text x="782" y="226" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Rust Pricing &amp; Surface Engine</text>
+  <text x="782" y="226" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Rust Pricing and Surface Engine</text>
   <text x="782" y="244" fill="#8b98a5" font-family="monospace" font-size="11">Black-Scholes Spread Fair Value</text>
   <text x="782" y="262" fill="#8b98a5" font-family="monospace" font-size="11">SVI Volatility Smile Calibration</text>
 
   <rect x="768" y="286" width="280" height="78" rx="6" fill="#0b1117" stroke="#233240"/>
-  <text x="782" y="310" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Host Daemons &amp; TEE Enclave</text>
-  <text x="782" y="328" fill="#8b98a5" font-family="monospace" font-size="11">chain-host · oracle-signer (x4)</text>
-  <text x="782" y="346" fill="#8b98a5" font-family="monospace" font-size="11">private-ledger · confidential-worker</text>
+  <text x="782" y="310" fill="#f4ede4" font-family="sans-serif" font-size="13" font-weight="600">Host Daemons and TEE Enclave</text>
+  <text x="782" y="328" fill="#8b98a5" font-family="monospace" font-size="11">chain-host : oracle-signer (x4)</text>
+  <text x="782" y="346" fill="#8b98a5" font-family="monospace" font-size="11">private-ledger : confidential-worker</text>
 
-  <!-- Connectors -->
   <line x1="312" y1="150" x2="376" y2="150" stroke="#c6f24e" stroke-width="2" marker-end="url(#arrow)"/>
   <line x1="376" y1="220" x2="312" y2="220" stroke="#5fc39c" stroke-width="2" marker-end="url(#arrowTeal)"/>
   <line x1="680" y1="150" x2="744" y2="150" stroke="#c6f24e" stroke-width="2" marker-end="url(#arrow)"/>

@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="100%" height="320">
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#090d12"/>
@@ -16,35 +17,29 @@
   <rect width="1200" height="320" rx="16" fill="url(#bg)" stroke="#243140" stroke-width="2"/>
   <rect width="1200" height="320" rx="16" fill="url(#grid)" opacity="0.55"/>
 
-  <!-- Bounded Payoff Curve Visual on Right -->
   <g transform="translate(690, 42)">
     <rect x="0" y="0" width="460" height="236" rx="10" fill="#0b1117" stroke="#22303e" stroke-width="1.5"/>
     <rect x="40" y="48" width="380" height="96" fill="url(#spreadFill)"/>
-    <!-- Upper Cap Line (High Strike) -->
     <line x1="40" y1="48" x2="420" y2="48" stroke="#5fc39c" stroke-width="2" stroke-dasharray="5,4"/>
-    <text x="48" y="40" fill="#5fc39c" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="600">CAP · K_high ($2,500) · Max Payout Locked</text>
-    <!-- Break-Even Line -->
+    <text x="48" y="40" fill="#5fc39c" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="600">CAP : K_high ($2,500) : Max Payout Locked</text>
     <line x1="40" y1="108" x2="420" y2="108" stroke="#c6f24e" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.8"/>
-    <text x="48" y="101" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">BREAK-EVEN · K_low + Premium</text>
-    <!-- Lower Floor Line (Low Strike) -->
+    <text x="48" y="101" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">BREAK-EVEN : K_low + Premium</text>
     <line x1="40" y1="144" x2="420" y2="144" stroke="#c6f24e" stroke-width="2"/>
-    <text x="48" y="162" fill="#9aa5b1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">FLOOR · K_low ($2,400) · Max Loss = Premium</text>
-    <!-- Payoff Trajectory -->
+    <text x="48" y="162" fill="#9aa5b1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">FLOOR : K_low ($2,400) : Max Loss = Premium</text>
     <path d="M 40 192 L 155 192 L 305 48 L 420 48" fill="none" stroke="#c6f24e" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
     <circle cx="155" cy="192" r="5" fill="#0b1117" stroke="#c6f24e" stroke-width="2.5"/>
     <circle cx="230" cy="108" r="5" fill="#c6f24e"/>
     <circle cx="305" cy="48" r="5" fill="#5fc39c"/>
-    <text x="48" y="218" fill="#6e7a86" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">ZERO LIQUIDATIONS · 100% COLLATERALIZED ON NEAR</text>
+    <text x="48" y="218" fill="#6e7a86" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">ZERO LIQUIDATIONS : 100% COLLATERALIZED ON NEAR</text>
   </g>
 
-  <!-- Brand & Title on Left -->
   <g transform="translate(56, 58)">
-    <rect x="0" y="0" width="188" height="28" rx="14" fill="#16222f" stroke="#2c3e50" stroke-width="1"/>
+    <rect x="0" y="0" width="326" height="28" rx="14" fill="#16222f" stroke="#2c3e50" stroke-width="1"/>
     <circle cx="16" cy="14" r="5" fill="#c6f24e"/>
-    <text x="30" y="18" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700" letter-spacing="1.2">OPTIONALITYHQ / CORE</text>
+    <text x="30" y="18" fill="#c6f24e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700" letter-spacing="1.2">OPTIONALITYHQ / OPTIONALITY-CORE</text>
 
-    <text x="0" y="88" fill="#f4ede4" font-family="-apple-system, BlinkMacSystemFont, Inter, Segoe UI, sans-serif" font-size="46" font-weight="800" letter-spacing="-1">Optionality Core</text>
-    <text x="0" y="132" fill="#a8b3cf" font-family="-apple-system, BlinkMacSystemFont, Inter, Segoe UI, sans-serif" font-size="19" font-weight="400">Bounded Options Smart Contracts, Volatility Engine & Oracle Daemons</text>
+    <text x="0" y="88" fill="#f4ede4" font-family="-apple-system, BlinkMacSystemFont, Inter, Segoe UI, sans-serif" font-size="44" font-weight="800" letter-spacing="-1">Optionality Core</text>
+    <text x="0" y="130" fill="#a8b3cf" font-family="-apple-system, BlinkMacSystemFont, Inter, Segoe UI, sans-serif" font-size="17" font-weight="400">Bounded Options Smart Contracts, Volatility Engine and Oracle Daemons</text>
 
     <g transform="translate(0, 168)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#8b98a5">
       <rect x="0" y="0" width="150" height="32" rx="6" fill="#111922" stroke="#233140"/>

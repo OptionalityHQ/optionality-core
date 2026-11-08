@@ -1,18 +1,18 @@
 <div align="center">
 
-<img src="./docs/assets/banner.svg" alt="Optionality Core Banner" width="100%" />
+<img src="./docs/assets/banner.png" alt="Optionality Core Banner" width="100%" />
 
 <br />
 
-[![NEAR SDK](https://img.shields.io/badge/NEAR_SDK-5.x-00EC97?style=flat-square&logo=near)](https://github.com/OptionalityHQ/core)
-[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat-square&logo=rust)](https://github.com/OptionalityHQ/core)
-[![Tests](https://img.shields.io/badge/Rust_Tests-280%2B_Passing-success?style=flat-square)](https://github.com/OptionalityHQ/core)
+[![NEAR SDK](https://img.shields.io/badge/NEAR_SDK-5.x-00EC97?style=flat-square&logo=near)](https://github.com/OptionalityHQ/optionality-core)
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat-square&logo=rust)](https://github.com/OptionalityHQ/optionality-core)
+[![Tests](https://img.shields.io/badge/Rust_Tests-280%2B_Passing-success?style=flat-square)](https://github.com/OptionalityHQ/optionality-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](./Cargo.toml)
 [![Live Venue](https://img.shields.io/badge/Live_Venue-optionality.pro-c6f24e?style=flat-square)](https://optionality.pro)
 
 **Core Smart Contracts, Rust Volatility Surface Engine, Confidential TEE Ledger & Oracle Daemons for Optionality**
 
-[Live Terminal](https://optionality.pro) · [Protocol Docs](https://optionality.pro/docs) · [Semantic Ontology](./docs/ONTOLOGY.md) · [Interface Repo](https://github.com/OptionalityHQ/interface) · [Adapter Repo](https://github.com/OptionalityHQ/adapter)
+[Live Terminal](https://optionality.pro) · [Protocol Docs](https://optionality.pro/docs) · [Semantic Ontology](./docs/ONTOLOGY.md) · [Interface Repo](https://github.com/OptionalityHQ/optionality-interface) · [Adapter Repo](https://github.com/OptionalityHQ/optionality-adapter)
 
 </div>
 
@@ -20,19 +20,19 @@
 
 ## Overview
 
-In 1865, Chicago grain merchants created standardized contracts so a farmer could lock in a floor price for wheat before the harvest — paying a known upfront fee so a price crash could never wipe out the farm. Today's crypto derivatives markets replaced that protection with leveraged perpetuals that liquidate the buyer on a temporary wick, or naked options whose writers can go insolvent when volatility spikes.
+In 1865, Chicago grain merchants created standardized contracts so a farmer could lock in a floor price for wheat before the harvest: paying a known upfront fee so a price crash could never wipe out the farm. Today's crypto derivatives markets replaced that protection with leveraged perpetuals that liquidate the buyer on a temporary wick, or naked options whose writers can go insolvent when volatility spikes.
 
 **Optionality Core** implements **Bounded Options** on NEAR Protocol: every Call and Put is structured as a **collateral-locked vertical spread** $[K_{\text{low}}, K_{\text{high}}]$. Because the maximum payout per contract is strictly bounded by $W = K_{\text{high}} - K_{\text{low}}$, the smart contract locks **100% of the worst-case payout in NEP-141 USDT** the instant a position opens.
 
 It enables traders, liquidity providers, and autonomous agents to:
 
-- **Eliminate Liquidation & Counterparty Risk** — Buyers can never be liquidated mid-trade (max loss is the upfront USDT premium), and the LP Vault can never go insolvent (100% of $W \times q$ is locked in escrow).
-- **Trade Hybrid Pool + CLOB Liquidity** — Take instant quotes from the automated Black-Scholes LP Pool Vault or rest/match limit bids and asks on the on-chain Central Limit Order Book.
-- **Settle on an Independent 3-of-4 Oracle Committee** — Four isolated signer processes (**Pyth**, **Kraken**, **OKX**, and **Venue Index**) sign prices with independent Ed25519 keys; settlement requires a 3-of-4 quorum median.
-- **Execute Confidential Copy Trading** — Run zero-front-running follower mandates inside the `private-ledger` and `confidential-protocol` crates.
+- **Eliminate Liquidation & Counterparty Risk**: Buyers can never be liquidated mid-trade (max loss is the upfront USDT premium), and the LP Vault can never go insolvent (100% of $W \times q$ is locked in escrow).
+- **Trade Hybrid Pool + CLOB Liquidity**: Take instant quotes from the automated Black-Scholes LP Pool Vault or rest/match limit bids and asks on the on-chain Central Limit Order Book.
+- **Settle on an Independent 3-of-4 Oracle Committee**: Four isolated signer processes (**Pyth**, **Kraken**, **OKX**, and **Venue Index**) sign prices with independent Ed25519 keys; settlement requires a 3-of-4 quorum median.
+- **Execute Confidential Copy Trading**: Run zero-front-running follower mandates inside the `private-ledger` and `confidential-protocol` crates.
 
 <p align="center">
-  <img src="./docs/assets/architecture.svg" alt="Optionality System Architecture" width="900" />
+  <img src="./docs/assets/architecture.png" alt="Optionality System Architecture" width="900" />
 </p>
 
 ---
@@ -59,16 +59,16 @@ It enables traders, liquidity providers, and autonomous agents to:
 ## How It Works & Protocol Ontology
 
 <p align="center">
-  <img src="./docs/assets/ontology-graph.svg" alt="Optionality Semantic Ontology Graph" width="900" />
+  <img src="./docs/assets/ontology-graph.png" alt="Optionality Semantic Ontology Graph" width="900" />
 </p>
 
 Optionality Core is modeled around five source-grounded semantic entities (see [`docs/ONTOLOGY.md`](./docs/ONTOLOGY.md) for the full Question, Relationship, and Measure contracts):
 
-1. **`Series` ($[K_{\text{low}}, K_{\text{high}}, T]$)** — Defines a bounded Call or Put spread on BTC or ETH.
-2. **`PoolVault`** — Holds LP capital in two strict buckets: `free_liquidity` (available to underwrite new spreads) and `locked_collateral` (reserved 1:1 for open tickets).
-3. **`Ticket`** — An on-chain position receipt recording the holder, contract size $q$, entry cost paid, and whether the holder chose **Liquid** (50 bps fee, can sell early back to the pool or book) or **Hold-to-Expiry** (0 bps fee, pays pure Black-Scholes mid).
-4. **`RestingOrder`** — Maker limit bids and collateralized limit asks resting on a series book.
-5. **`OracleCommittee`** — Four independent seats submitting signed prints at expiry; the contract sorts valid prints and fixes the median $S_T$.
+1. **`Series` ($[K_{\text{low}}, K_{\text{high}}, T]$)**: Defines a bounded Call or Put spread on BTC or ETH.
+2. **`PoolVault`**: Holds LP capital in two strict buckets: `free_liquidity` (available to underwrite new spreads) and `locked_collateral` (reserved 1:1 for open tickets).
+3. **`Ticket`**: An on-chain position receipt recording the holder, contract size $q$, entry cost paid, and whether the holder chose **Liquid** (50 bps fee, can sell early back to the pool or book) or **Hold-to-Expiry** (0 bps fee, pays pure Black-Scholes mid).
+4. **`RestingOrder`**: Maker limit bids and collateralized limit asks resting on a series book.
+5. **`OracleCommittee`**: Four independent seats submitting signed prints at expiry; the contract sorts valid prints and fixes the median $S_T$.
 
 ```mermaid
 sequenceDiagram
@@ -122,8 +122,8 @@ core/
 ### 1. Build Contracts & Workspace Crates
 
 ```bash
-git clone https://github.com/OptionalityHQ/core.git
-cd core
+git clone https://github.com/OptionalityHQ/optionality-core.git
+cd optionality-core
 bash scripts/build.sh
 ```
 
