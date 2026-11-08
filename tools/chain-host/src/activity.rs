@@ -38,6 +38,29 @@ pub fn pick(
     Some(Play { series_id: want.series_id, budget_units: want.premium_units * BUDGET_BPS / 1_020 })
 }
 
+/// Check presence JSON string. Returns true if active flag is set and updated within max_idle_ms.
+pub fn is_presence_active_at(data: &str, now_ms: u64, max_idle_ms: u64) -> bool {
+    let Ok(val) = serde_json::from_str::<Value>(data) else { return false; };
+    if val.get("active").and_then(|v| v.as_bool()) != Some(true) {
+        return false;
+    }
+    let updated_at = val.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    now_ms.saturating_sub(updated_at) < max_idle_ms
+}
+
+/// Reads presence file. If ALWAYS_ACTIVE env var is set, returns true unconditionally.
+pub fn is_presence_active(path: &std::path::Path) -> bool {
+    if std::env::var("ALWAYS_ACTIVE").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        return true;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else { return false; };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    is_presence_active_at(&content, now_ms, 90_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +95,20 @@ mod tests {
     #[test]
     fn with_nothing_listed_there_is_nothing_to_buy() {
         assert!(pick(2_360, &[plan("Call", 3_000, 3_100, 5)], &[], EXPIRY).is_none());
+    }
+
+    #[test]
+    fn presence_detection_respects_active_flag_and_timestamp() {
+        let now = 1_000_000;
+        let active_json = r#"{"active":true,"streams":1,"updated_at":950000}"#;
+        assert!(is_presence_active_at(active_json, now, 90_000));
+
+        let expired_json = r#"{"active":true,"streams":0,"updated_at":800000}"#;
+        assert!(!is_presence_active_at(expired_json, now, 90_000));
+
+        let inactive_json = r#"{"active":false,"streams":0,"updated_at":990000}"#;
+        assert!(!is_presence_active_at(inactive_json, now, 90_000));
+
+        assert!(!is_presence_active_at("invalid json", now, 90_000));
     }
 }

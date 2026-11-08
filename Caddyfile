@@ -1,0 +1,5 @@
+:80 {
+    reverse_proxy venue:8790 {
+        flush_interval -1
+    }
+}

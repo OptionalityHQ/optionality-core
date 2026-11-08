@@ -1,0 +1,22 @@
+[Unit]
+Description=Optionality Market Venue
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/optionality/near-mvp
+Environment="PROFILE=release"
+Environment="FOREGROUND=1"
+Environment="SKIP_BUILD=1"
+Environment="ENGINE_PORT=8791"
+Environment="GATEWAY_PORT=8790"
+Environment="ASSETS=ETH,BTC"
+ExecStart=/bin/bash /opt/optionality/near-mvp/scripts/venue.sh foreground
+ExecStop=/bin/bash /opt/optionality/near-mvp/scripts/venue.sh stop
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

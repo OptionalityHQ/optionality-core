@@ -497,8 +497,8 @@ pub fn schedule(now_ns: u64, near_ns: u64, hours: u64) -> Vec<u64> {
             expiries.push(expiry);
         }
     }
-    // The daily close: 08:00 UTC, the hour a listed option expires.
-    let close = (now_ns / DAY) * DAY + 8 * HOUR;
+    // The daily close: 00:00 UTC (12:00 AM UTC+0), the hour a listed daily option expires.
+    let close = (now_ns / DAY) * DAY;
     for day in [1u64, 2, 3, 5, 7] {
         let mut expiry = close + day * DAY;
         while expiry <= now_ns {
@@ -574,15 +574,15 @@ mod tests {
     fn the_intraday_grid_sits_in_front_of_the_daily_closes() {
         let hour = 3_600_000_000_000u64;
         let day = 24 * hour;
-        let now = 1_793_280_000 * 1_000_000_000; // 08:00 UTC
+        let now = 1_793_251_200 * 1_000_000_000; // 00:00 UTC (12:00 AM UTC+0)
         let expiries = schedule(now, 30 * 60 * 1_000_000_000, 2);
         assert_eq!(expiries[0], now + hour / 2, "the tenor asked for comes first");
         let hours: Vec<u64> = expiries.iter().copied().filter(|ns| ns % hour == 0).take(2).collect();
         assert_eq!(hours.len(), 2, "two whole hours behind it: {expiries:?}");
         assert!(hours.windows(2).all(|pair| pair[1] - pair[0] == hour), "consecutive");
         assert!(hours[0] > now + hour / 2, "and all of them after the near tenor");
-        let closes = expiries.iter().filter(|ns| **ns % day == 8 * hour).count();
-        assert_eq!(closes, 5, "five 08:00 closes are still listed behind them");
+        let closes = expiries.iter().filter(|ns| **ns % day == 0).count();
+        assert_eq!(closes, 5, "five 00:00 UTC closes are still listed behind them");
         assert!(expiries.windows(2).all(|pair| pair[0] < pair[1]));
 
         // An hour is added even when the near tenor already lands on it: two ways
@@ -595,14 +595,14 @@ mod tests {
     #[test]
     fn the_venue_lists_a_week_with_most_of_it_inside_three_days() {
         let hour = 3_600_000_000_000u64;
-        let now = 1_793_280_000 * 1_000_000_000; // 08:00 UTC, the daily close
+        let now = 1_793_251_200 * 1_000_000_000; // 00:00 UTC (12:00 AM UTC+0), the daily close
         let expiries = schedule(now, 4 * hour, 2);
         assert_eq!(expiries.len(), 7, "{expiries:?}");
         assert!(expiries.windows(2).all(|pair| pair[0] < pair[1]), "sorted and distinct");
         assert_eq!(expiries[0], now + 4 * hour, "the near tenor is the one asked for");
         let inside_three_days = expiries.iter().filter(|ns| **ns <= now + 3 * 24 * hour).count();
         assert_eq!(inside_three_days, 5, "most of the ladder is inside three days");
-        // The last close is 08:00 UTC on day seven, which from a mid-afternoon
+        // The last close is 00:00 UTC on day seven, which from a mid-afternoon
         // start is six and a half days out rather than exactly seven.
         let furthest = *expiries.last().unwrap();
         assert!(furthest >= now + 6 * 24 * hour, "and it reaches into next week");

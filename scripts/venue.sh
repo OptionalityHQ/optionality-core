@@ -31,10 +31,14 @@ IMPACT_BPS=${IMPACT_BPS:-100}
 SESSION=${SESSION:-data/chain-session.json}
 LOGS=logs
 
+PROFILE=${PROFILE:-debug}
+CARGO_FLAG=$([ "$PROFILE" = "release" ] && echo "--release" || echo "")
+BIN_DIR="target/$PROFILE"
+
 busy_on() { lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -3; }
 
 stop_all() {
-  for pattern in "target/debug/chain-host" "target/debug/engine" "target/debug/oracle-signer" "api/src/server.ts"; do
+  for pattern in "$BIN_DIR/chain-host" "$BIN_DIR/engine" "$BIN_DIR/oracle-signer" "target/debug/chain-host" "target/debug/engine" "target/release/chain-host" "target/release/engine" "api/src/server.ts" "near-sandbox"; do
     local pids
     pids=$(pgrep -f "$pattern" || true)
     if [ -n "$pids" ]; then
@@ -61,17 +65,19 @@ for port in "$ENGINE_PORT" "$GATEWAY_PORT"; do
 done
 
 mkdir -p "$LOGS" data
-./scripts/build.sh
-cargo build -q -p engine -p chain-host -p oracle-signer
-# The page the gateway serves is the template's output, so building the venue
-# without rebuilding the page would serve yesterday's screen from today's chain.
-node sim/build-demo.mjs
+if [ "${SKIP_BUILD:-}" != "1" ]; then
+  ./scripts/build.sh
+  cargo build -q $CARGO_FLAG -p engine -p chain-host -p oracle-signer
+  # The page the gateway serves is the template's output, so building the venue
+  # without rebuilding the page would serve yesterday's screen from today's chain.
+  node sim/build-demo.mjs
+fi
 
-nohup ./target/debug/engine --port "$ENGINE_PORT" --assets "$ASSETS" \
+nohup ./"$BIN_DIR"/engine --port "$ENGINE_PORT" --assets "$ASSETS" \
   --expiry-hours "$EXPIRY_HOURS" --hours "$HOURS" > "$LOGS/engine.log" 2>&1 &
 sleep 2
 
-nohup ./target/debug/chain-host --out "$SESSION" \
+nohup ./"$BIN_DIR"/chain-host --out "$SESSION" \
   --engine "http://127.0.0.1:$ENGINE_PORT" --assets "$ASSETS" \
   --tick-secs "$TICK_SECS" --list-secs "$LIST_SECS" --maker "$MAKER_ROLE" --activity "$ACTIVITY_ROLE" \
   --margin-bps "$MARGIN_BPS" --impact-bps "$IMPACT_BPS" > "$LOGS/host.log" 2>&1 &
@@ -86,7 +92,7 @@ ready=no
 # A week of ladders is five hundred series to commit before the session exists,
 # so the budget is minutes rather than seconds.
 for _ in $(seq 1 300); do
-  grep -q "session written" "$LOGS/host.log" 2>/dev/null && { ready=yes; break; }
+  grep -aq "session written" "$LOGS/host.log" 2>/dev/null && { ready=yes; break; }
   sleep 2
 done
 if [ "$ready" != yes ]; then
@@ -107,3 +113,17 @@ echo "  engine   http://127.0.0.1:$ENGINE_PORT/state?asset=ETH · /feed · /inde
 echo "  gateway  $CONTRACT"
 echo "  logs     $LOGS/engine.log · $LOGS/host.log · $LOGS/gateway.log"
 echo "  stop     scripts/venue.sh stop"
+
+if [ "${FOREGROUND:-}" = "1" ] || [ "${1:-}" = "foreground" ]; then
+  echo "running in foreground (Ctrl+C to stop)..."
+  trap stop_all EXIT INT TERM
+  tail -F "$LOGS/engine.log" "$LOGS/host.log" "$LOGS/gateway.log" &
+  while true; do
+    sleep 5
+    if ! pgrep -f "api/src/server.ts" >/dev/null 2>&1; then
+      echo "[venue] gateway process exited; restarting api/src/server.ts..." >> "$LOGS/gateway.log"
+      nohup node api/src/server.ts --session "$SESSION" \
+        --engine "http://127.0.0.1:$ENGINE_PORT" --port "$GATEWAY_PORT" >> "$LOGS/gateway.log" 2>&1 &
+    fi
+  done
+fi

@@ -1,0 +1,39 @@
+services:
+  venue:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: optionality-venue
+    restart: unless-stopped
+    ports:
+      - "8790:8790"
+    environment:
+      - ENGINE_PORT=8791
+      - GATEWAY_PORT=8790
+      - ASSETS=ETH,BTC
+      - PROFILE=release
+      - SKIP_BUILD=1
+      - FOREGROUND=1
+    volumes:
+      - venue-data:/app/data
+      - venue-logs:/app/logs
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: optionality-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - venue
+
+volumes:
+  venue-data:
+  venue-logs:
+  caddy-data:
+  caddy-config:

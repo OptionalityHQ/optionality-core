@@ -2,12 +2,14 @@
 sim/.bundle-check.mjs
 
 /data/testnet-seats/
-
 /data/private/
+/data/wallet-accounts.json
+/data/active-presence.json
 /demo/wallet.js
 /demo/wallet.css
 
 /demo/positions-chart.js
+/demo/media/*.mp4
 
 .env
 

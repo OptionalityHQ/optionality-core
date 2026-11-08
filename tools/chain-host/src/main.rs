@@ -796,7 +796,7 @@ async fn main() -> Result<()> {
         let now_ns = worker.view_block().await?.timestamp();
         // The nearest ladder only: the tick loop walks the rest, and a boot that
         // quotes a week of ladders is a boot nobody waits for.
-        for expiry_ns in expiries.iter().copied().take(1) {
+        for expiry_ns in expiries.iter().copied().take(3) {
             match read_standing(&options, &rows, expiry_ns).await {
                 Ok(live) => match quote_ladder(
                     &admin,
@@ -1017,24 +1017,28 @@ async fn main() -> Result<()> {
                     Err(error) => println!("quote read failed, chain still live: {error}"),
                 }
             }
-            if let Some(maker) = &maker_account {
-                if last_maker.elapsed().as_secs() >= maker_secs {
-                    last_maker = std::time::Instant::now();
-                    match run_maker(maker, &options, url, &assets_list, &rows).await {
-                        Ok(0) => {}
-                        Ok(acted) => println!("maker quoted {acted} order(s)"),
-                        Err(error) => println!("maker failed, chain still live: {error}"),
+            let presence_file = std::path::Path::new("data/active-presence.json");
+            let user_active = activity::is_presence_active(presence_file);
+            if user_active {
+                if let Some(maker) = &maker_account {
+                    if last_maker.elapsed().as_secs() >= maker_secs {
+                        last_maker = std::time::Instant::now();
+                        match run_maker(maker, &options, url, &assets_list, &rows).await {
+                            Ok(0) => {}
+                            Ok(acted) => println!("maker quoted {acted} order(s)"),
+                            Err(error) => println!("maker failed, chain still live: {error}"),
+                        }
                     }
                 }
-            }
-            if let Some(actor) = &activity_account {
-                if last_activity.elapsed().as_secs() >= 18 {
-                    last_activity = std::time::Instant::now();
-                    activity_turn += 1;
-                    match run_activity(actor, &options, url, &assets_list, &rows, activity_turn).await {
-                        Ok(Some(done)) => println!("activity: {done}"),
-                        Ok(None) => {}
-                        Err(error) => println!("activity failed, chain still live: {error}"),
+                if let Some(actor) = &activity_account {
+                    if last_activity.elapsed().as_secs() >= 18 {
+                        last_activity = std::time::Instant::now();
+                        activity_turn += 1;
+                        match run_activity(actor, &options, url, &assets_list, &rows, activity_turn).await {
+                            Ok(Some(done)) => println!("activity: {done}"),
+                            Ok(None) => {}
+                            Err(error) => println!("activity failed, chain still live: {error}"),
+                        }
                     }
                 }
             }
